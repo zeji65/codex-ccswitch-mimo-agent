@@ -1182,6 +1182,7 @@ pub fn run() {
             commands::remove_from_failover_queue,
             commands::get_auto_failover_enabled,
             commands::set_auto_failover_enabled,
+            commands::rotate_codex_account,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_trends,
@@ -1249,6 +1250,8 @@ pub fn run() {
             commands::auth_get_status,
             commands::auth_remove_account,
             commands::auth_set_default_account,
+            commands::auth_import_current,
+            commands::auth_switch_current_account,
             commands::auth_logout,
             // Copilot OAuth commands (multi-account support)
             commands::copilot_start_device_flow,

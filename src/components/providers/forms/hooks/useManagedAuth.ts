@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { authApi, settingsApi } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import type {
+  ManagedAuthAccount,
   ManagedAuthProvider,
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
@@ -15,12 +16,14 @@ export function useManagedAuth(
   githubDomain?: string,
 ) {
   const queryClient = useQueryClient();
-  const queryKey = ["managed-auth-status", authProvider];
+  const queryKey = ["managed-auth-status", authProvider] as const;
 
   const [pollingState, setPollingState] = useState<PollingState>("idle");
   const [deviceCode, setDeviceCode] =
     useState<ManagedAuthDeviceCodeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lastCompletedAccount, setLastCompletedAccount] =
+    useState<ManagedAuthAccount | null>(null);
 
   const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(
     null,
@@ -54,12 +57,35 @@ export function useManagedAuth(
     };
   }, [stopPolling]);
 
+  const refreshManagedAuthState = useCallback(
+    async (options?: { includeCodexProviders?: boolean }) => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+
+      if (authProvider !== "codex_oauth") {
+        return;
+      }
+
+      if (options?.includeCodexProviders) {
+        await queryClient.invalidateQueries({
+          queryKey: ["providers", "codex"],
+        });
+      }
+
+      await queryClient.invalidateQueries({
+        queryKey: ["codex_oauth", "quota"],
+      });
+    },
+    [authProvider, queryClient, queryKey, refetchStatus],
+  );
+
   const startLoginMutation = useMutation({
     mutationFn: () => authApi.authStartLogin(authProvider, githubDomain),
     onSuccess: async (response) => {
       setDeviceCode(response);
       setPollingState("polling");
       setError(null);
+      setLastCompletedAccount(null);
 
       try {
         await copyText(response.user_code);
@@ -94,6 +120,7 @@ export function useManagedAuth(
           );
           if (newAccount) {
             stopPolling();
+            setLastCompletedAccount(newAccount);
             setPollingState("success");
             await refetchStatus();
             await queryClient.invalidateQueries({ queryKey });
@@ -124,6 +151,7 @@ export function useManagedAuth(
     onError: (e) => {
       setPollingState("error");
       setError(e instanceof Error ? e.message : String(e));
+      setLastCompletedAccount(null);
     },
   });
 
@@ -137,9 +165,11 @@ export function useManagedAuth(
         provider: authProvider,
         authenticated: false,
         default_account_id: null,
+        current_account_id: null,
+        current_account_login: null,
         accounts: [],
       });
-      await queryClient.invalidateQueries({ queryKey });
+      await refreshManagedAuthState();
     },
     onError: async (e) => {
       console.error("[ManagedAuth] Failed to logout:", e);
@@ -155,8 +185,7 @@ export function useManagedAuth(
       setPollingState("idle");
       setDeviceCode(null);
       setError(null);
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await refreshManagedAuthState();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to remove account:", e);
@@ -168,8 +197,7 @@ export function useManagedAuth(
     mutationFn: (accountId: string) =>
       authApi.authSetDefaultAccount(authProvider, accountId),
     onSuccess: async () => {
-      await refetchStatus();
-      await queryClient.invalidateQueries({ queryKey });
+      await refreshManagedAuthState();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to set default account:", e);
@@ -177,12 +205,57 @@ export function useManagedAuth(
     },
   });
 
-  const startAuth = useCallback(() => {
+  const importCurrentMutation = useMutation({
+    mutationFn: () => authApi.authImportCurrent(authProvider),
+    onSuccess: async () => {
+      setPollingState("idle");
+      setDeviceCode(null);
+      setError(null);
+      await refreshManagedAuthState();
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to import current auth:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const switchCurrentAccountMutation = useMutation({
+    mutationFn: (accountId: string | null) =>
+      authApi.authSwitchCurrentAccount(authProvider, accountId),
+    onSuccess: async () => {
+      setError(null);
+      await refreshManagedAuthState({ includeCodexProviders: true });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to switch current account:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const rotateCodexAccountMutation = useMutation({
+    mutationFn: (forceNext?: boolean) => {
+      if (authProvider !== "codex_oauth") {
+        return Promise.reject(new Error("当前仅支持 Codex OAuth 自动轮换账号"));
+      }
+      return authApi.rotateCodexAccount(forceNext ?? false);
+    },
+    onSuccess: async () => {
+      setError(null);
+      await refreshManagedAuthState({ includeCodexProviders: true });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to rotate Codex account:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const startAuth = useCallback(async () => {
     setPollingState("idle");
     setDeviceCode(null);
     setError(null);
+    setLastCompletedAccount(null);
     stopPolling();
-    startLoginMutation.mutate();
+    return startLoginMutation.mutateAsync();
   }, [startLoginMutation, stopPolling]);
 
   const cancelAuth = useCallback(() => {
@@ -190,6 +263,7 @@ export function useManagedAuth(
     setPollingState("idle");
     setDeviceCode(null);
     setError(null);
+    setLastCompletedAccount(null);
   }, [stopPolling]);
 
   const logout = useCallback(() => {
@@ -210,6 +284,27 @@ export function useManagedAuth(
     [setDefaultAccountMutation],
   );
 
+  const importCurrent = useCallback(async () => {
+    setError(null);
+    return importCurrentMutation.mutateAsync();
+  }, [importCurrentMutation]);
+
+  const switchCurrentAccount = useCallback(
+    async (accountId: string | null) => {
+      setError(null);
+      return switchCurrentAccountMutation.mutateAsync(accountId);
+    },
+    [switchCurrentAccountMutation],
+  );
+
+  const rotateCodexAccount = useCallback(
+    async (forceNext = false) => {
+      setError(null);
+      return rotateCodexAccountMutation.mutateAsync(forceNext);
+    },
+    [rotateCodexAccountMutation],
+  );
+
   const accounts = authStatus?.accounts ?? [];
 
   return {
@@ -219,16 +314,25 @@ export function useManagedAuth(
     hasAnyAccount: accounts.length > 0,
     isAuthenticated: authStatus?.authenticated ?? false,
     defaultAccountId: authStatus?.default_account_id ?? null,
+    currentAccountId: authStatus?.current_account_id ?? null,
+    currentAccountLogin: authStatus?.current_account_login ?? null,
     migrationError: authStatus?.migration_error ?? null,
     pollingState,
     deviceCode,
     error,
+    lastCompletedAccount,
     isPolling: pollingState === "polling",
     isAddingAccount: startLoginMutation.isPending || pollingState === "polling",
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
+    isImportingCurrent: importCurrentMutation.isPending,
+    isSwitchingCurrent: switchCurrentAccountMutation.isPending,
+    isRotatingCodex: rotateCodexAccountMutation.isPending,
     startAuth,
     addAccount: startAuth,
+    importCurrent,
+    switchCurrentAccount,
+    rotateCodexAccount,
     cancelAuth,
     logout,
     removeAccount,

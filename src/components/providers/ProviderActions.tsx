@@ -15,6 +15,12 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { AppId } from "@/lib/api";
 
@@ -41,6 +47,46 @@ interface ProviderActionsProps {
   // OpenClaw: default model
   isDefaultModel?: boolean;
   onSetAsDefault?: () => void;
+}
+
+interface ActionIconButtonProps {
+  label: string;
+  icon: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  disabledReason?: string;
+  className?: string;
+}
+
+function ActionIconButton({
+  label,
+  icon,
+  onClick,
+  disabled = false,
+  disabledReason,
+  className,
+}: ActionIconButtonProps) {
+  const tooltipText = disabled && disabledReason ? disabledReason : label;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={disabled ? undefined : onClick}
+            disabled={disabled}
+            title={tooltipText}
+            className={className}
+          >
+            {icon}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>{tooltipText}</TooltipContent>
+    </Tooltip>
+  );
 }
 
 export function ProviderActions({
@@ -206,120 +252,117 @@ export function ProviderActions({
   const canDelete = isOmo || isAdditiveMode ? true : !isCurrent;
 
   return (
-    <div className="flex items-center gap-1.5">
-      {appId === "openclaw" && isInConfig && onSetAsDefault && (
-        <Button
-          size="sm"
-          variant={isDefaultModel ? "secondary" : "default"}
-          onClick={isDefaultModel ? undefined : onSetAsDefault}
-          disabled={isDefaultModel}
-          className={cn(
-            "w-fit px-2.5",
-            isDefaultModel
-              ? "bg-gray-200 text-muted-foreground dark:bg-gray-700 opacity-60 cursor-not-allowed"
-              : "bg-blue-500 hover:bg-blue-600 dark:bg-blue-600 dark:hover:bg-blue-700",
-          )}
-        >
-          <Zap className="h-4 w-4" />
-          {isDefaultModel
-            ? t("provider.isDefault", { defaultValue: "当前默认" })
-            : t("provider.setAsDefault", { defaultValue: "设为默认" })}
-        </Button>
-      )}
-
-      <Button
-        size="sm"
-        variant={buttonState.variant}
-        onClick={handleMainButtonClick}
-        disabled={buttonState.disabled}
-        className={cn("w-[4.5rem] px-2.5", buttonState.className)}
-      >
-        {buttonState.icon}
-        {buttonState.text}
-      </Button>
-
-      <div className="flex items-center gap-1">
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onEdit}
-          title={t("common.edit")}
-          className={iconButtonClass}
-        >
-          <Edit className="h-4 w-4" />
-        </Button>
-
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onDuplicate}
-          title={t("provider.duplicate")}
-          className={iconButtonClass}
-        >
-          <Copy className="h-4 w-4" />
-        </Button>
-
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onTest || undefined}
-          disabled={isTesting}
-          title={t("modelTest.testProvider", "测试模型")}
-          className={cn(
-            iconButtonClass,
-            !onTest && "opacity-40 cursor-not-allowed text-muted-foreground",
-          )}
-        >
-          {isTesting ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <TestTube2 className="h-4 w-4" />
-          )}
-        </Button>
-
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onConfigureUsage || undefined}
-          title={t("provider.configureUsage")}
-          className={cn(
-            iconButtonClass,
-            !onConfigureUsage &&
-              "opacity-40 cursor-not-allowed text-muted-foreground",
-          )}
-        >
-          <BarChart3 className="h-4 w-4" />
-        </Button>
-
-        {onOpenTerminal && (
+    <TooltipProvider delayDuration={250}>
+      <div className="flex items-center gap-1.5">
+        {appId === "openclaw" && isInConfig && onSetAsDefault && (
           <Button
-            size="icon"
-            variant="ghost"
-            onClick={onOpenTerminal}
-            title={t("provider.openTerminal", "打开终端")}
+            size="sm"
+            variant={isDefaultModel ? "secondary" : "default"}
+            onClick={isDefaultModel ? undefined : onSetAsDefault}
+            disabled={isDefaultModel}
             className={cn(
-              iconButtonClass,
-              "hover:text-emerald-600 dark:hover:text-emerald-400",
+              "w-fit px-2.5",
+              isDefaultModel
+                ? "bg-gray-200 text-muted-foreground dark:bg-gray-700 opacity-60 cursor-not-allowed"
+                : "bg-blue-500 hover:bg-blue-600 dark:bg-blue-600 dark:hover:bg-blue-700",
             )}
           >
-            <Terminal className="h-4 w-4" />
+            <Zap className="h-4 w-4" />
+            {isDefaultModel
+              ? t("provider.isDefault", { defaultValue: "当前默认" })
+              : t("provider.setAsDefault", { defaultValue: "设为默认" })}
           </Button>
         )}
 
         <Button
-          size="icon"
-          variant="ghost"
-          onClick={canDelete ? onDelete : undefined}
-          title={t("common.delete")}
-          className={cn(
-            iconButtonClass,
-            canDelete && "hover:text-red-500 dark:hover:text-red-400",
-            !canDelete && "opacity-40 cursor-not-allowed text-muted-foreground",
-          )}
+          size="sm"
+          variant={buttonState.variant}
+          onClick={handleMainButtonClick}
+          disabled={buttonState.disabled}
+          className={cn("w-[4.5rem] px-2.5", buttonState.className)}
         >
-          <Trash2 className="h-4 w-4" />
+          {buttonState.icon}
+          {buttonState.text}
         </Button>
+
+        <div className="flex items-center gap-1">
+          <ActionIconButton
+            label={t("common.edit")}
+            icon={<Edit className="h-4 w-4" />}
+            onClick={onEdit}
+            className={iconButtonClass}
+          />
+
+          <ActionIconButton
+            label={t("provider.duplicate")}
+            icon={<Copy className="h-4 w-4" />}
+            onClick={onDuplicate}
+            className={iconButtonClass}
+          />
+
+          {(onTest || isTesting) && (
+            <ActionIconButton
+              label={t("modelTest.testProvider", "测试模型")}
+              icon={
+                isTesting ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <TestTube2 className="h-4 w-4" />
+                )
+              }
+              onClick={onTest}
+              disabled={Boolean(isTesting) || !onTest}
+              disabledReason={
+                isTesting
+                  ? t("modelTest.testing", { defaultValue: "测试中..." })
+                  : t("provider.testUnavailable", {
+                      defaultValue: "当前 provider 不支持测试模型",
+                    })
+              }
+              className={cn(
+                iconButtonClass,
+                !onTest && "text-muted-foreground",
+              )}
+            />
+          )}
+
+          {onConfigureUsage && (
+            <ActionIconButton
+              label={t("provider.configureUsage")}
+              icon={<BarChart3 className="h-4 w-4" />}
+              onClick={onConfigureUsage}
+              className={iconButtonClass}
+            />
+          )}
+
+          {onOpenTerminal && (
+            <ActionIconButton
+              label={t("provider.openTerminal", "打开终端")}
+              icon={<Terminal className="h-4 w-4" />}
+              onClick={onOpenTerminal}
+              className={cn(
+                iconButtonClass,
+                "hover:text-emerald-600 dark:hover:text-emerald-400",
+              )}
+            />
+          )}
+
+          <ActionIconButton
+            label={t("common.delete")}
+            icon={<Trash2 className="h-4 w-4" />}
+            onClick={onDelete}
+            disabled={!canDelete}
+            disabledReason={t("provider.deleteCurrentDisabled", {
+              defaultValue: "当前使用中的 provider 不能直接删除",
+            })}
+            className={cn(
+              iconButtonClass,
+              canDelete && "hover:text-red-500 dark:hover:text-red-400",
+              !canDelete && "text-muted-foreground",
+            )}
+          />
+        </div>
       </div>
-    </div>
+    </TooltipProvider>
   );
 }

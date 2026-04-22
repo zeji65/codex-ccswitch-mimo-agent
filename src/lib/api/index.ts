@@ -27,4 +27,6 @@ export type {
   ManagedAuthAccount,
   ManagedAuthStatus,
   ManagedAuthDeviceCodeResponse,
+  CodexRotationCheckedAccount,
+  CodexRotationResult,
 } from "./auth";

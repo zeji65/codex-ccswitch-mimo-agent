@@ -16,6 +16,8 @@ export interface ManagedAuthStatus {
   provider: ManagedAuthProvider;
   authenticated: boolean;
   default_account_id: string | null;
+  current_account_id: string | null;
+  current_account_login: string | null;
   migration_error?: string | null;
   accounts: ManagedAuthAccount[];
 }
@@ -27,6 +29,22 @@ export interface ManagedAuthDeviceCodeResponse {
   verification_uri: string;
   expires_in: number;
   interval: number;
+}
+
+export interface CodexRotationCheckedAccount {
+  account_id: string;
+  account_login: string;
+  available: boolean;
+  reason: string;
+}
+
+export interface CodexRotationResult {
+  switched: boolean;
+  reason: string;
+  from_account_id: string | null;
+  to_account_id: string | null;
+  to_account_login: string | null;
+  checked_accounts: CodexRotationCheckedAccount[];
 }
 
 export async function authStartLogin(
@@ -87,11 +105,37 @@ export async function authSetDefaultAccount(
   });
 }
 
+export async function authImportCurrent(
+  authProvider: ManagedAuthProvider,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_import_current", {
+    authProvider,
+  });
+}
+
+export async function authSwitchCurrentAccount(
+  authProvider: ManagedAuthProvider,
+  accountId?: string | null,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_switch_current_account", {
+    authProvider,
+    accountId: accountId ?? null,
+  });
+}
+
 export async function authLogout(
   authProvider: ManagedAuthProvider,
 ): Promise<void> {
   return invoke("auth_logout", {
     authProvider,
+  });
+}
+
+export async function rotateCodexAccount(
+  forceNext = false,
+): Promise<CodexRotationResult> {
+  return invoke<CodexRotationResult>("rotate_codex_account", {
+    forceNext,
   });
 }
 
@@ -102,5 +146,8 @@ export const authApi = {
   authGetStatus,
   authRemoveAccount,
   authSetDefaultAccount,
+  authImportCurrent,
+  authSwitchCurrentAccount,
   authLogout,
+  rotateCodexAccount,
 };

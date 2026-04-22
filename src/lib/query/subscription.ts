@@ -20,6 +20,7 @@ export function useSubscriptionQuota(
     refetchIntervalInBackground: autoQuery,
     refetchOnWindowFocus: autoQuery,
     staleTime: REFETCH_INTERVAL,
+    gcTime: 10 * 60 * 1000,
     retry: 1,
   });
 }

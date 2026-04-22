@@ -19,13 +19,12 @@ interface CodexOauthQuotaFooterProps {
 const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
   meta,
   inline = false,
-  isCurrent = false,
 }) => {
   const {
     data: quota,
     isFetching: loading,
     refetch,
-  } = useCodexOauthQuota(meta, { enabled: true, autoQuery: isCurrent });
+  } = useCodexOauthQuota(meta, { enabled: true, autoQuery: false });
 
   return (
     <SubscriptionQuotaView
@@ -34,6 +33,7 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
       refetch={refetch}
       appIdForExpiredHint="codex_oauth"
       inline={inline}
+      displayMode="remaining"
     />
   );
 };

@@ -41,12 +41,22 @@ pub async fn save_settings(settings: crate::settings::AppSettings) -> Result<boo
 
 /// 重启应用程序（当 app_config_dir 变更后使用）
 #[tauri::command]
-pub async fn restart_app(app: AppHandle) -> Result<bool, String> {
+pub async fn restart_app(_app: AppHandle) -> Result<bool, String> {
+    #[cfg(debug_assertions)]
+    {
+        return Err("开发模式下不支持自动重启，请手动重新启动应用。".to_string());
+    }
+
+    #[cfg(not(debug_assertions))]
+    let app = _app;
+
     // 在后台延迟重启，让函数有时间返回响应
+    #[cfg(not(debug_assertions))]
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         app.restart();
     });
+
     Ok(true)
 }
 

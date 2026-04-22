@@ -18,7 +18,10 @@ interface SubscriptionQuotaViewProps {
   /** 用于 `subscription.expiredHint` 的 {tool} 插值；解耦了 hook 的 appId */
   appIdForExpiredHint: string;
   inline?: boolean;
+  displayMode?: QuotaDisplayMode;
 }
+
+export type QuotaDisplayMode = "utilization" | "remaining";
 
 /** 已知 tier 名称的显示映射（官方订阅 + Token Plan 共用） */
 export const TIER_I18N_KEYS: Record<string, string> = {
@@ -41,6 +44,49 @@ export function utilizationColor(utilization: number): string {
   if (utilization >= 90) return "text-red-500 dark:text-red-400";
   if (utilization >= 70) return "text-orange-500 dark:text-orange-400";
   return "text-green-600 dark:text-green-400";
+}
+
+export function quotaRemainingPercent(utilization: number): number {
+  return Math.max(0, Math.min(100, 100 - utilization));
+}
+
+export function quotaDisplayPercent(
+  utilization: number,
+  displayMode: QuotaDisplayMode = "utilization",
+): number {
+  return displayMode === "remaining"
+    ? quotaRemainingPercent(utilization)
+    : Math.max(0, Math.min(100, utilization));
+}
+
+export function quotaDisplayColor(
+  utilization: number,
+  displayMode: QuotaDisplayMode = "utilization",
+): string {
+  if (displayMode === "remaining") {
+    const remaining = quotaRemainingPercent(utilization);
+    if (remaining <= 10) return "text-red-500 dark:text-red-400";
+    if (remaining <= 30) return "text-orange-500 dark:text-orange-400";
+    return "text-green-600 dark:text-green-400";
+  }
+
+  return utilizationColor(utilization);
+}
+
+function quotaDisplayBarClass(
+  utilization: number,
+  displayMode: QuotaDisplayMode = "utilization",
+): string {
+  if (displayMode === "remaining") {
+    const remaining = quotaRemainingPercent(utilization);
+    if (remaining <= 10) return "bg-red-500";
+    if (remaining <= 30) return "bg-orange-500";
+    return "bg-green-500";
+  }
+
+  if (utilization >= 90) return "bg-red-500";
+  if (utilization >= 70) return "bg-orange-500";
+  return "bg-green-500";
 }
 
 /** 计算倒计时的纯时间字符串，如 "2h30m"、"3d12h" */
@@ -74,7 +120,7 @@ function formatResetTime(
 const HIDDEN_INLINE_TIERS = new Set(["seven_day_sonnet"]);
 
 /** 格式化相对时间（与 UsageFooter 一致） */
-function formatRelativeTime(
+export function formatQuotaRelativeTime(
   timestamp: number,
   now: number,
   t: (key: string, options?: { count?: number }) => string,
@@ -102,6 +148,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
   refetch,
   appIdForExpiredHint,
   inline = false,
+  displayMode = "utilization",
 }) => {
   const { t } = useTranslation();
 
@@ -217,7 +264,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
             <Clock size={10} />
             {quota.queriedAt
-              ? formatRelativeTime(quota.queriedAt, now, t)
+              ? formatQuotaRelativeTime(quota.queriedAt, now, t)
               : t("usage.never", { defaultValue: "从未更新" })}
           </span>
           <button
@@ -238,7 +285,12 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           {tiers
             .filter((tier) => !HIDDEN_INLINE_TIERS.has(tier.name))
             .map((tier) => (
-              <TierBadge key={tier.name} tier={tier} t={t} />
+              <TierBadge
+                key={tier.name}
+                tier={tier}
+                t={t}
+                displayMode={displayMode}
+              />
             ))}
         </div>
       </div>
@@ -256,7 +308,7 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
           {quota.queriedAt && (
             <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1">
               <Clock size={10} />
-              {formatRelativeTime(quota.queriedAt, now, t)}
+              {formatQuotaRelativeTime(quota.queriedAt, now, t)}
             </span>
           )}
           <button
@@ -272,7 +324,12 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 
       <div className="flex flex-col gap-2">
         {tiers.map((tier) => (
-          <TierBar key={tier.name} tier={tier} t={t} />
+          <TierBar
+            key={tier.name}
+            tier={tier}
+            t={t}
+            displayMode={displayMode}
+          />
         ))}
       </div>
 
@@ -301,19 +358,24 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
 export const TierBadge: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
-}> = ({ tier, t }) => {
+  displayMode?: QuotaDisplayMode;
+}> = ({ tier, t, displayMode = "utilization" }) => {
   const label = TIER_I18N_KEYS[tier.name]
     ? t(TIER_I18N_KEYS[tier.name])
     : tier.name;
   const countdown = countdownStr(tier.resetsAt);
+  const percent = quotaDisplayPercent(tier.utilization, displayMode);
 
   return (
     <div className="flex items-center gap-0.5">
       <span className="text-gray-500 dark:text-gray-400">{label}:</span>
       <span
-        className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
+        className={`font-semibold tabular-nums ${quotaDisplayColor(
+          tier.utilization,
+          displayMode,
+        )}`}
       >
-        {t("subscription.utilization", { value: Math.round(tier.utilization) })}
+        {t("subscription.utilization", { value: Math.round(percent) })}
       </span>
       {countdown && (
         <span className="text-muted-foreground/60 ml-0.5 flex items-center gap-px">
@@ -329,11 +391,13 @@ export const TierBadge: React.FC<{
 const TierBar: React.FC<{
   tier: QuotaTier;
   t: (key: string, options?: Record<string, unknown>) => string;
-}> = ({ tier, t }) => {
+  displayMode?: QuotaDisplayMode;
+}> = ({ tier, t, displayMode = "utilization" }) => {
   const label = TIER_I18N_KEYS[tier.name]
     ? t(TIER_I18N_KEYS[tier.name])
     : tier.name;
   const resetText = formatResetTime(tier.resetsAt, t);
+  const percent = quotaDisplayPercent(tier.utilization, displayMode);
 
   return (
     <div className="flex items-center gap-3 text-xs">
@@ -347,14 +411,11 @@ const TierBar: React.FC<{
       {/* 进度条 */}
       <div className="flex-1 h-2 bg-gray-100 dark:bg-gray-800 rounded-full overflow-hidden">
         <div
-          className={`h-full rounded-full transition-all ${
-            tier.utilization >= 90
-              ? "bg-red-500"
-              : tier.utilization >= 70
-                ? "bg-orange-500"
-                : "bg-green-500"
-          }`}
-          style={{ width: `${Math.min(tier.utilization, 100)}%` }}
+          className={`h-full rounded-full transition-all ${quotaDisplayBarClass(
+            tier.utilization,
+            displayMode,
+          )}`}
+          style={{ width: `${percent}%` }}
         />
       </div>
 
@@ -363,9 +424,12 @@ const TierBar: React.FC<{
         style={{ width: "30%" }}
       >
         <span
-          className={`font-semibold tabular-nums ${utilizationColor(tier.utilization)}`}
+          className={`font-semibold tabular-nums ${quotaDisplayColor(
+            tier.utilization,
+            displayMode,
+          )}`}
         >
-          {Math.round(tier.utilization)}%
+          {Math.round(percent)}%
         </span>
         {resetText && (
           <span
