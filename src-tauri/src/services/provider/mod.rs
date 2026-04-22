@@ -29,8 +29,9 @@ pub use live::{
 pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_effective_settings_with_common_config, normalize_provider_common_config_for_storage,
-    provider_exists_in_live_config, strip_common_config_from_live_settings,
-    sync_current_provider_for_app_to_live, write_live_with_common_config,
+    provider_exists_in_live_config, resolve_codex_live_parts,
+    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
+    write_live_with_common_config,
 };
 
 // Internal re-exports
@@ -1188,13 +1189,34 @@ impl ProviderService {
             return Ok(true);
         }
 
-        // Save to database
-        state.db.save_provider(app_type.as_str(), &provider)?;
-
         // For other apps: Check if this is current provider (use effective current, not just DB)
         let effective_current =
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
+
+        if matches!(app_type, AppType::Codex)
+            && provider.category.as_deref() == Some("official")
+            && is_current
+        {
+            let original_provider = existing_provider.as_ref().ok_or_else(|| {
+                AppError::Message(format!(
+                    "Original provider '{}' does not exist in app '{}'",
+                    original_id,
+                    app_type.as_str()
+                ))
+            })?;
+
+            crate::services::codex_desktop::switch_desktop_to_provider(
+                state,
+                &provider,
+                Some(original_provider),
+                false,
+            )?;
+            return Ok(true);
+        }
+
+        // Save to database
+        state.db.save_provider(app_type.as_str(), &provider)?;
 
         if is_current {
             // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
@@ -1451,6 +1473,13 @@ impl ProviderService {
         let provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        if matches!(app_type, AppType::Codex) && provider.category.as_deref() == Some("official") {
+            crate::services::codex_desktop::switch_desktop_to_provider(
+                state, provider, None, true,
+            )?;
+            return Ok(SwitchResult::default());
+        }
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
         if matches!(app_type, AppType::OpenCode) {

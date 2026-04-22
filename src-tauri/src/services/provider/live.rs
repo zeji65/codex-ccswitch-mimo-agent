@@ -12,7 +12,8 @@ use crate::codex_config::{get_codex_auth_path, get_codex_config_path};
 use crate::config::{delete_file, get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
 use crate::error::AppError;
-use crate::provider::Provider;
+use crate::provider::{AuthBindingSource, Provider};
+use crate::proxy::providers::codex_oauth_auth::{CodexOAuthError, CodexOAuthManager};
 use crate::services::mcp::McpService;
 use crate::store::AppState;
 
@@ -512,6 +513,88 @@ pub(crate) fn write_live_with_common_config(
     write_live_snapshot(app_type, &effective_provider)
 }
 
+fn codex_managed_account_id(provider: &Provider) -> Option<Option<String>> {
+    let binding = provider.meta.as_ref()?.auth_binding.as_ref()?;
+    if binding.source != AuthBindingSource::ManagedAccount {
+        return None;
+    }
+    if binding.auth_provider.as_deref() != Some("codex_oauth") {
+        return None;
+    }
+    Some(binding.account_id.clone())
+}
+
+fn codex_backfill_auth_placeholder(provider: &Provider) -> Option<Value> {
+    codex_managed_account_id(provider).map(|_| {
+        provider
+            .settings_config
+            .get("auth")
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    })
+}
+
+fn build_codex_managed_auth(account_id: Option<&str>) -> Result<Value, AppError> {
+    let manager = CodexOAuthManager::new(crate::config::get_app_config_dir());
+
+    tauri::async_runtime::block_on(manager.build_native_auth(account_id)).map_err(|err| {
+        let message = match err {
+            CodexOAuthError::RefreshTokenInvalid => {
+                "CODEX_OAUTH_REAUTH_REQUIRED: 当前账号的登录态已失效，请重新登录 ChatGPT 账号"
+                    .to_string()
+            }
+            CodexOAuthError::ParseError(message)
+                if message.contains("缺少 id_token")
+                    || message.contains("持久化 auth.json 快照") =>
+            {
+                "CODEX_OAUTH_IMPORT_CURRENT_REQUIRED: 当前账号缺少完整桌面登录态，请先导入当前 Codex 登录或重新登录 ChatGPT 账号"
+                    .to_string()
+            }
+            CodexOAuthError::AccountNotFound(account_id) => {
+                format!("CODEX_OAUTH_ACCOUNT_MISSING: 找不到要切换的 ChatGPT 账号：{account_id}")
+            }
+            CodexOAuthError::NetworkError(message)
+            | CodexOAuthError::TokenFetchFailed(message)
+            | CodexOAuthError::IoError(message) => format!(
+                "CODEX_OAUTH_TEMPORARY_FAILURE: 当前无法刷新 ChatGPT 登录态，请稍后重试：{message}"
+            ),
+            other => format!("CODEX_OAUTH_SWITCH_PRECHECK_FAILED: 无法生成 Codex 官方账号凭据：{other}"),
+        };
+        AppError::Message(message)
+    })
+}
+
+pub(crate) fn resolve_codex_live_parts(provider: &Provider) -> Result<(Value, String), AppError> {
+    let obj = provider
+        .settings_config
+        .as_object()
+        .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".to_string()))?;
+
+    let config_str = obj
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    if let Some(account_id) = codex_managed_account_id(provider) {
+        let auth = build_codex_managed_auth(account_id.as_deref())?;
+        return Ok((auth, config_str));
+    }
+
+    let auth = obj
+        .get("auth")
+        .cloned()
+        .ok_or_else(|| AppError::Config("Codex 供应商配置缺少 'auth' 字段".to_string()))?;
+
+    if !auth.is_object() {
+        return Err(AppError::Config(
+            "Codex 供应商配置中的 'auth' 字段必须是 JSON 对象".to_string(),
+        ));
+    }
+
+    Ok((auth, config_str))
+}
+
 pub(crate) fn strip_common_config_from_live_settings(
     db: &Database,
     app_type: &AppType,
@@ -526,29 +609,45 @@ pub(crate) fn strip_common_config_from_live_settings(
                 app_type.as_str(),
                 provider.id
             );
-            return live_settings;
+            let mut fallback = live_settings;
+            if matches!(app_type, AppType::Codex) {
+                if let Some(auth_placeholder) = codex_backfill_auth_placeholder(provider) {
+                    if let Some(obj) = fallback.as_object_mut() {
+                        obj.insert("auth".to_string(), auth_placeholder);
+                    }
+                }
+            }
+            return fallback;
         }
     };
 
-    if !provider_uses_common_config(app_type, provider, snippet.as_deref()) {
-        return live_settings;
-    }
-
-    let Some(snippet_text) = snippet.as_deref() else {
-        return live_settings;
+    let mut stripped = if !provider_uses_common_config(app_type, provider, snippet.as_deref()) {
+        live_settings
+    } else if let Some(snippet_text) = snippet.as_deref() {
+        match remove_common_config_from_settings(app_type, &live_settings, snippet_text) {
+            Ok(settings) => settings,
+            Err(err) => {
+                log::warn!(
+                    "Failed to strip common config for {} provider '{}': {err}",
+                    app_type.as_str(),
+                    provider.id
+                );
+                live_settings
+            }
+        }
+    } else {
+        live_settings
     };
 
-    match remove_common_config_from_settings(app_type, &live_settings, snippet_text) {
-        Ok(settings) => settings,
-        Err(err) => {
-            log::warn!(
-                "Failed to strip common config for {} provider '{}': {err}",
-                app_type.as_str(),
-                provider.id
-            );
-            live_settings
+    if matches!(app_type, AppType::Codex) {
+        if let Some(auth_placeholder) = codex_backfill_auth_placeholder(provider) {
+            if let Some(obj) = stripped.as_object_mut() {
+                obj.insert("auth".to_string(), auth_placeholder);
+            }
         }
     }
+
+    stripped
 }
 
 pub(crate) fn normalize_provider_common_config_for_storage(
@@ -670,21 +769,8 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             write_json_file(&path, &settings)?;
         }
         AppType::Codex => {
-            let obj = provider
-                .settings_config
-                .as_object()
-                .ok_or_else(|| AppError::Config("Codex 供应商配置必须是 JSON 对象".to_string()))?;
-            let auth = obj
-                .get("auth")
-                .ok_or_else(|| AppError::Config("Codex 供应商配置缺少 'auth' 字段".to_string()))?;
-            let config_str = obj.get("config").and_then(|v| v.as_str()).ok_or_else(|| {
-                AppError::Config("Codex 供应商配置缺少 'config' 字段或不是字符串".to_string())
-            })?;
-
-            let auth_path = get_codex_auth_path();
-            write_json_file(&auth_path, auth)?;
-            let config_path = get_codex_config_path();
-            std::fs::write(&config_path, config_str).map_err(|e| AppError::io(&config_path, e))?;
+            let (auth, config_str) = resolve_codex_live_parts(provider)?;
+            crate::codex_config::write_codex_live_atomic(&auth, Some(&config_str))?;
         }
         AppType::Gemini => {
             // Delegate to write_gemini_live which handles env file writing correctly
@@ -1338,6 +1424,8 @@ pub fn remove_openclaw_provider_from_live(provider_id: &str) -> Result<(), AppEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::Database;
+    use crate::provider::{AuthBinding, ProviderMeta};
     use serde_json::json;
 
     #[test]
@@ -1461,5 +1549,45 @@ mod tests {
             .map(|value| value.as_str().expect("tool id should be string"))
             .collect();
         assert_eq!(values, vec!["tool2"]);
+    }
+
+    #[test]
+    fn codex_backfill_keeps_placeholder_auth_for_managed_account_provider() {
+        let db = Database::memory().expect("in-memory db");
+        let mut provider = Provider::with_id(
+            "codex-official".to_string(),
+            "Codex Official".to_string(),
+            json!({
+                "auth": {},
+                "config": ""
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            auth_binding: Some(AuthBinding {
+                source: AuthBindingSource::ManagedAccount,
+                auth_provider: Some("codex_oauth".to_string()),
+                account_id: Some("acc-123".to_string()),
+            }),
+            ..Default::default()
+        });
+
+        let live_settings = json!({
+            "auth": {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "at",
+                    "refresh_token": "rt",
+                    "account_id": "acc-123"
+                }
+            },
+            "config": "model = \"gpt-5.4\"\n"
+        });
+
+        let stripped =
+            strip_common_config_from_live_settings(&db, &AppType::Codex, &provider, live_settings);
+
+        assert_eq!(stripped["auth"], json!({}));
+        assert_eq!(stripped["config"], json!("model = \"gpt-5.4\"\n"));
     }
 }

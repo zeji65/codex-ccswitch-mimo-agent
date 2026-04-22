@@ -57,6 +57,7 @@ import { ClaudeFormFields } from "./ClaudeFormFields";
 import { CodexFormFields } from "./CodexFormFields";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
+import { CodexOAuthSection } from "./CodexOAuthSection";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
 import {
   ProviderAdvancedConfig,
@@ -825,6 +826,14 @@ export function ProviderForm({
       );
       return;
     }
+    if (isCodexOfficialManagedProvider && !isCodexOauthAuthenticated) {
+      toast.error(
+        t("codexOauth.loginRequired", {
+          defaultValue: "请先登录 ChatGPT 账号",
+        }),
+      );
+      return;
+    }
 
     if (category !== "official" && category !== "cloud_provider") {
       if (appId === "claude") {
@@ -1057,6 +1066,12 @@ export function ProviderForm({
             authProvider: "github_copilot",
             accountId: selectedGitHubAccountId ?? undefined,
           }
+        : isCodexOfficialManagedProvider
+          ? {
+              source: "managed_account",
+              authProvider: "codex_oauth",
+              accountId: selectedCodexAccountId ?? undefined,
+            }
         : isCodexOauthProvider
           ? {
               source: "managed_account",
@@ -1191,6 +1206,22 @@ export function ProviderForm({
     codexBaseUrl,
     initialData,
   });
+
+  const isCodexOfficialManagedProvider =
+    appId === "codex" && category === "official";
+
+  const { data: currentProviderId } = useQuery({
+    queryKey: ["current-provider", appId],
+    queryFn: () => providersApi.getCurrent(appId),
+    enabled: appId === "codex" && isCodexOfficialManagedProvider && !!providerId,
+    staleTime: 30_000,
+  });
+
+  const canDirectSwitchCodexAccount =
+    appId === "codex" &&
+    isCodexOfficialManagedProvider &&
+    Boolean(providerId) &&
+    currentProviderId === providerId;
 
   const handlePresetChange = (value: string) => {
     setSelectedPresetId(value);
@@ -1583,32 +1614,41 @@ export function ProviderForm({
           )}
 
           {appId === "codex" && (
-            <CodexFormFields
-              providerId={providerId}
-              codexApiKey={codexApiKey}
-              onApiKeyChange={handleCodexApiKeyChange}
-              category={category}
-              shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
-              websiteUrl={codexWebsiteUrl}
-              isPartner={isCodexPartner}
-              partnerPromotionKey={codexPartnerPromotionKey}
-              shouldShowSpeedTest={shouldShowSpeedTest}
-              codexBaseUrl={codexBaseUrl}
-              onBaseUrlChange={handleCodexBaseUrlChange}
-              isFullUrl={localIsFullUrl}
-              onFullUrlChange={setLocalIsFullUrl}
-              isEndpointModalOpen={isCodexEndpointModalOpen}
-              onEndpointModalToggle={setIsCodexEndpointModalOpen}
-              onCustomEndpointsChange={
-                isEditMode ? undefined : setDraftCustomEndpoints
-              }
-              autoSelect={endpointAutoSelect}
-              onAutoSelectChange={setEndpointAutoSelect}
-              shouldShowModelField={category !== "official"}
-              modelName={codexModelName}
-              onModelNameChange={handleCodexModelNameChange}
-              speedTestEndpoints={speedTestEndpoints}
-            />
+            <>
+              {isCodexOfficialManagedProvider && (
+                <CodexOAuthSection
+                  selectedAccountId={selectedCodexAccountId}
+                  onAccountSelect={setSelectedCodexAccountId}
+                  enableDirectSwitch={canDirectSwitchCodexAccount}
+                />
+              )}
+              <CodexFormFields
+                providerId={providerId}
+                codexApiKey={codexApiKey}
+                onApiKeyChange={handleCodexApiKeyChange}
+                category={category}
+                shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
+                websiteUrl={codexWebsiteUrl}
+                isPartner={isCodexPartner}
+                partnerPromotionKey={codexPartnerPromotionKey}
+                shouldShowSpeedTest={shouldShowSpeedTest}
+                codexBaseUrl={codexBaseUrl}
+                onBaseUrlChange={handleCodexBaseUrlChange}
+                isFullUrl={localIsFullUrl}
+                onFullUrlChange={setLocalIsFullUrl}
+                isEndpointModalOpen={isCodexEndpointModalOpen}
+                onEndpointModalToggle={setIsCodexEndpointModalOpen}
+                onCustomEndpointsChange={
+                  isEditMode ? undefined : setDraftCustomEndpoints
+                }
+                autoSelect={endpointAutoSelect}
+                onAutoSelectChange={setEndpointAutoSelect}
+                shouldShowModelField={category !== "official"}
+                modelName={codexModelName}
+                onModelNameChange={handleCodexModelNameChange}
+                speedTestEndpoints={speedTestEndpoints}
+              />
+            </>
           )}
 
           {appId === "gemini" && (

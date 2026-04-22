@@ -180,8 +180,12 @@ export function ProviderCard({
   const isCopilot =
     provider.meta?.providerType === PROVIDER_TYPES.GITHUB_COPILOT ||
     provider.meta?.usage_script?.templateType === "github_copilot";
+  const hasCodexOauthBinding =
+    provider.meta?.authBinding?.source === "managed_account" &&
+    provider.meta?.authBinding?.authProvider === PROVIDER_TYPES.CODEX_OAUTH;
   const isCodexOauth =
-    provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH;
+    provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH ||
+    hasCodexOauthBinding;
 
   // 获取用量数据以判断是否有多套餐
   // 累加模式应用（OpenCode/OpenClaw）：使用 isInConfig 代替 isCurrent
