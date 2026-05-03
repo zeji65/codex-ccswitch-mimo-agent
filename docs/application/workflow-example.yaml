@@ -1,0 +1,90 @@
+# Example workflow skeleton for the Codex + CC Switch multi-agent R&D system.
+# This file intentionally contains no secrets and no company-private rules.
+
+project:
+  name: codex-ccswitch-multi-agent-rd
+  entrypoint: codex-desktop
+  gateway: cc-switch
+
+models:
+  daily_interaction:
+    primary: mimo
+    fallback: deepseek
+  unit_test_generation:
+    primary: mimo
+    fallback: qwen
+  code_refactor:
+    primary: deepseek
+    fallback: qwen
+  long_document:
+    primary: kimi
+    fallback: mimo
+
+token_governance:
+  monthly_baseline_tokens: 960000000
+  monthly_target_tokens: 1600000000
+  cache:
+    original_hit_rate: 0.14
+    target_hit_rate: 0.78
+    strategy:
+      - prompt_normalization
+      - semantic_vector_match
+      - task_result_cache
+      - cross_model_cache_reuse
+
+agents:
+  - id: code-listener
+    role: scan git repositories, parse AST, extract context and technical debt signals
+    input:
+      - git_diff
+      - repository_tree
+      - historical_review_notes
+    output:
+      - structured_context
+      - technical_debt_candidates
+
+  - id: policy-matcher
+    role: match code context with architecture, security, and engineering rules
+    input:
+      - structured_context
+      - architecture_rules
+      - security_rules
+    output:
+      - refactor_requirements
+      - risk_level
+      - acceptance_criteria
+
+  - id: model-router
+    role: choose model through CC Switch and manage token budget, cache, retries, and fallback
+    input:
+      - refactor_requirements
+      - task_type
+      - token_budget
+      - cache_candidates
+    output:
+      - selected_model
+      - routing_reason
+      - token_estimate
+
+  - id: refactor-agent
+    role: generate patch, tests, docs, and pull request description
+    input:
+      - selected_model
+      - refactor_requirements
+      - structured_context
+    output:
+      - patch
+      - tests
+      - docs_update
+      - pr_summary
+
+  - id: verification-agent
+    role: run tests, security scans, and CI checks, then feed failures back into the router
+    input:
+      - patch
+      - tests
+      - ci_logs
+    output:
+      - verification_report
+      - merge_recommendation
+      - retry_tasks
