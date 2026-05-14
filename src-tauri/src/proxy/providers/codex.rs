@@ -1,6 +1,6 @@
 //! Codex (OpenAI) Provider Adapter
 //!
-//! 仅透传模式，支持直连 OpenAI API
+//! 默认透传 OpenAI API；部分第三方 provider 可通过 apiFormat 走轻量转换链。
 //!
 //! ## 客户端检测
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
@@ -9,6 +9,7 @@ use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
+use serde_json::Value;
 use std::sync::LazyLock;
 
 /// 官方 Codex 客户端 User-Agent 正则
@@ -18,6 +19,27 @@ static CODEX_CLIENT_REGEX: LazyLock<Regex> =
 
 /// Codex 适配器
 pub struct CodexAdapter;
+
+pub fn get_codex_api_format(provider: &Provider) -> &'static str {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.api_format.as_deref())
+        .map(|format| match format {
+            "anthropic" => "anthropic",
+            "openai_chat" => "openai_chat",
+            _ => "openai_responses",
+        })
+        .unwrap_or("openai_responses")
+}
+
+fn should_strip_tools_for_openai_chat_bridge(provider: &Provider) -> bool {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        == Some("litellm_gateway")
+}
 
 impl CodexAdapter {
     pub fn new() -> Self {
@@ -70,6 +92,50 @@ impl CodexAdapter {
         }
 
         None
+    }
+
+    fn extract_configured_model(provider: &Provider) -> Option<String> {
+        fn non_empty(value: Option<&str>) -> Option<String> {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        }
+
+        provider
+            .settings_config
+            .get("config")
+            .and_then(|config| {
+                config
+                    .as_str()
+                    .and_then(crate::codex_config::extract_codex_toml_model)
+                    .or_else(|| non_empty(config.get("model").and_then(|value| value.as_str())))
+            })
+            .or_else(|| {
+                non_empty(
+                    provider
+                        .settings_config
+                        .get("model")
+                        .and_then(|value| value.as_str()),
+                )
+            })
+            .or_else(|| {
+                provider.settings_config.get("env").and_then(|env| {
+                    non_empty(env.get("OPENAI_MODEL").and_then(|value| value.as_str())).or_else(
+                        || non_empty(env.get("CODEX_MODEL").and_then(|value| value.as_str())),
+                    )
+                })
+            })
+    }
+
+    fn apply_configured_model(mut body: Value, provider: &Provider) -> Value {
+        if let Some(model) = Self::extract_configured_model(provider) {
+            if body.get("model").and_then(|value| value.as_str()) != Some(model.as_str()) {
+                log::debug!("[Codex] 覆盖第三方上游模型为供应商配置模型: {model}");
+            }
+            body["model"] = serde_json::json!(model);
+        }
+        body
     }
 }
 
@@ -132,8 +198,13 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn extract_auth(&self, provider: &Provider) -> Option<AuthInfo> {
+        let strategy = if matches!(get_codex_api_format(provider), "anthropic") {
+            AuthStrategy::Anthropic
+        } else {
+            AuthStrategy::Bearer
+        };
         self.extract_key(provider)
-            .map(|key| AuthInfo::new(key, AuthStrategy::Bearer))
+            .map(|key| AuthInfo::new(key, strategy))
     }
 
     fn build_url(&self, base_url: &str, endpoint: &str) -> String {
@@ -174,11 +245,62 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn get_auth_headers(&self, auth: &AuthInfo) -> Vec<(http::HeaderName, http::HeaderValue)> {
-        let bearer = format!("Bearer {}", auth.api_key);
-        vec![(
-            http::HeaderName::from_static("authorization"),
-            http::HeaderValue::from_str(&bearer).unwrap(),
-        )]
+        match auth.strategy {
+            AuthStrategy::Anthropic => vec![
+                (
+                    http::HeaderName::from_static("x-api-key"),
+                    http::HeaderValue::from_str(&auth.api_key).unwrap(),
+                ),
+                (
+                    http::HeaderName::from_static("api-key"),
+                    http::HeaderValue::from_str(&auth.api_key).unwrap(),
+                ),
+                (
+                    http::HeaderName::from_static("anthropic-version"),
+                    http::HeaderValue::from_static("2023-06-01"),
+                ),
+            ],
+            _ => {
+                let bearer = format!("Bearer {}", auth.api_key);
+                vec![(
+                    http::HeaderName::from_static("authorization"),
+                    http::HeaderValue::from_str(&bearer).unwrap(),
+                )]
+            }
+        }
+    }
+
+    fn needs_transform(&self, provider: &Provider) -> bool {
+        matches!(get_codex_api_format(provider), "anthropic" | "openai_chat")
+    }
+
+    fn transform_request(&self, body: Value, provider: &Provider) -> Result<Value, ProxyError> {
+        match get_codex_api_format(provider) {
+            "anthropic" => {
+                let body = Self::apply_configured_model(body, provider);
+                if body.get("input").is_some() {
+                    super::transform_responses::responses_request_to_anthropic(body)
+                } else {
+                    super::transform::openai_to_anthropic(body)
+                }
+            }
+            "openai_chat" => {
+                let mut body = Self::apply_configured_model(body, provider);
+                if should_strip_tools_for_openai_chat_bridge(provider) {
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("tools");
+                        obj.remove("tool_choice");
+                        obj.remove("parallel_tool_calls");
+                    }
+                }
+                if body.get("input").is_some() {
+                    super::transform_responses::responses_request_to_openai_chat(body)
+                } else {
+                    Ok(body)
+                }
+            }
+            _ => Ok(body),
+        }
     }
 }
 
@@ -227,6 +349,77 @@ mod tests {
         let auth = adapter.extract_auth(&provider).unwrap();
         assert_eq!(auth.api_key, "sk-test-key-12345678");
         assert_eq!(auth.strategy, AuthStrategy::Bearer);
+    }
+
+    #[test]
+    fn test_extract_auth_uses_anthropic_strategy_for_bridge_provider() {
+        let adapter = CodexAdapter::new();
+        let mut provider = create_provider(json!({
+            "auth": {
+                "OPENAI_API_KEY": "mimo-test-key-12345678"
+            }
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            ..Default::default()
+        });
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.api_key, "mimo-test-key-12345678");
+        assert_eq!(auth.strategy, AuthStrategy::Anthropic);
+    }
+
+    #[test]
+    fn test_get_auth_headers_uses_x_api_key_for_anthropic_bridge() {
+        let adapter = CodexAdapter::new();
+        let auth = AuthInfo::new(
+            "mimo-test-key-12345678".to_string(),
+            AuthStrategy::Anthropic,
+        );
+
+        let headers = adapter.get_auth_headers(&auth);
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[0].0, http::HeaderName::from_static("x-api-key"));
+        assert_eq!(
+            headers[0].1,
+            http::HeaderValue::from_static("mimo-test-key-12345678")
+        );
+        assert_eq!(headers[1].0, http::HeaderName::from_static("api-key"));
+        assert_eq!(
+            headers[2].0,
+            http::HeaderName::from_static("anthropic-version")
+        );
+    }
+
+    #[test]
+    fn test_anthropic_bridge_overrides_client_model_with_provider_model() {
+        let adapter = CodexAdapter::new();
+        let mut provider = create_provider(json!({
+            "config": r#"model_provider = "xiaomi_mimo"
+model = "mimo-v2-pro"
+
+[model_providers.xiaomi_mimo]
+base_url = "https://api.xiaomimimo.com/anthropic"
+"#
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            ..Default::default()
+        });
+
+        let body = json!({
+            "model": "gpt-5.3-codex",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "pong?" }]
+            }],
+            "stream": true
+        });
+
+        let result = adapter.transform_request(body, &provider).unwrap();
+
+        assert_eq!(result["model"], json!("mimo-v2-pro"));
+        assert_eq!(result["messages"][0]["role"], json!("user"));
     }
 
     #[test]

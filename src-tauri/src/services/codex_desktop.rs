@@ -49,6 +49,7 @@ pub fn restore_runtime_files(backup: &CodexRuntimeBackup) -> Result<(), AppError
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn switch_desktop_to_provider(
     state: &AppState,
     provider: &Provider,
@@ -236,6 +237,7 @@ async fn sync_tracked_runtime_auth_after_stop() {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub fn launch_codex_app() -> Result<(), AppError> {
     let app_path = find_codex_app_path()
         .ok_or_else(|| AppError::Message("未找到 Codex.app，请确认已安装桌面版".to_string()))?;
@@ -256,10 +258,16 @@ pub fn launch_codex_app() -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 pub fn launch_codex_app() -> Result<(), AppError> {
     Err(AppError::Message(
         "Codex 桌面账号切换当前仅支持 macOS".to_string(),
     ))
+}
+
+pub fn restart_codex_app() -> Result<(), AppError> {
+    stop_codex_processes()?;
+    launch_codex_app()
 }
 
 fn read_account_id_from_auth_value(value: &Value) -> Option<String> {
@@ -302,6 +310,7 @@ fn restore_current_provider(state: &AppState, provider_id: Option<&str>) -> Resu
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn find_codex_app_path() -> Option<PathBuf> {
     let candidates = [
         PathBuf::from("/Applications/Codex.app"),
@@ -312,6 +321,7 @@ fn find_codex_app_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn list_running_codex_pids() -> Result<Vec<i32>, AppError> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
@@ -350,13 +360,14 @@ fn list_running_codex_pids() -> Result<Vec<i32>, AppError> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn is_codex_process_command(command: &str) -> bool {
-    command.contains("Codex.app/")
-        || command.contains("Codex Helper")
-        || command.contains("Contents/Resources/codex app-server")
+    command.contains("Codex.app/Contents/MacOS/Codex")
+        || command.contains("Codex.app/Contents/Frameworks/Codex Helper")
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn stop_codex_processes() -> Result<(), AppError> {
     let initial_pids = list_running_codex_pids()?;
     if initial_pids.is_empty() {
@@ -395,6 +406,7 @@ fn stop_codex_processes() -> Result<(), AppError> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn stop_codex_processes() -> Result<(), AppError> {
     Err(AppError::Message(
         "Codex 桌面账号切换当前仅支持 macOS".to_string(),
@@ -438,6 +450,12 @@ mod tests {
         ));
         assert!(is_codex_process_command(
             "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=gpu-process"
+        ));
+        assert!(!is_codex_process_command(
+            "/Users/example/.vscode/extensions/openai.chatgpt/bin/macos-aarch64/codex app-server --analytics-default-enabled"
+        ));
+        assert!(!is_codex_process_command(
+            "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled"
         ));
         assert!(!is_codex_process_command(
             "/Applications/Other.app/Contents/MacOS/Other"

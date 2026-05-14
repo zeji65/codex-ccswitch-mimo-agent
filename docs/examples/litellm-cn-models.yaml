@@ -1,0 +1,37 @@
+model_list:
+  - model_name: codex-deepseek
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      api_base: https://api.deepseek.com/v1
+      stream: true
+      timeout: 600
+
+  - model_name: codex-mimo
+    litellm_params:
+      model: openai/mimo-v2.5-pro
+      api_key: os.environ/MIMO_API_KEY
+      api_base: https://token-plan-cn.xiaomimimo.com/v1
+      stream: true
+      timeout: 600
+
+  - model_name: codex-kimi
+    litellm_params:
+      model: openai/kimi-k2.5
+      api_key: os.environ/KIMI_API_KEY
+      api_base: https://api.moonshot.cn/v1
+      stream: true
+      timeout: 600
+
+  - model_name: codex-qwen
+    litellm_params:
+      model: openai/qwen3.5-plus
+      api_key: os.environ/QWEN_API_KEY
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      stream: true
+      timeout: 600
+
+general_settings:
+  master_key: sk-cc-switch-litellm
+  port: 4000
+  disable_telemetry: true

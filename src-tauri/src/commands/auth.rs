@@ -337,9 +337,6 @@ pub async fn auth_get_status(
         }
         AUTH_PROVIDER_CODEX_OAUTH => {
             let auth_manager = codex_state.0.read().await;
-            if let Err(err) = auth_manager.sync_current_native_auth_if_tracked().await {
-                log::debug!("[CodexOAuth] 跳过 auth status 自动同步: {err}");
-            }
             let status = auth_manager.get_status().await;
             let default_account_id = status.default_account_id.clone();
             let current_account_id =

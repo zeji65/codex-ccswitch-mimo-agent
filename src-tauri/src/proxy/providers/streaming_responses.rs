@@ -8,12 +8,19 @@
 //!
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
-use super::transform_responses::{build_anthropic_usage_from_responses, map_responses_stop_reason};
+use super::transform_responses::{
+    anthropic_response_to_responses, build_anthropic_usage_from_responses,
+    build_responses_usage_from_anthropic, build_responses_usage_from_openai_chat,
+    map_responses_stop_reason,
+};
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+pub type AnthropicHistoryRecorder = Arc<dyn Fn(String, Vec<Value>) + Send + Sync>;
 
 #[inline]
 fn response_object_from_event(data: &Value) -> &Value {
@@ -741,6 +748,569 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
     }
 }
 
+/// 创建从 Anthropic SSE 到 OpenAI Responses SSE 的转换流
+#[allow(dead_code)]
+pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_from_anthropic_with_history(stream, Vec::new(), None)
+}
+
+pub fn create_responses_sse_stream_from_openai_chat<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut response_id = String::new();
+        let mut model = String::new();
+        let mut text = String::new();
+        let mut started = false;
+        let mut completed = false;
+        let mut usage = json!({});
+
+        tokio::pin!(stream);
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+
+                    while let Some(block) = take_sse_block(&mut buffer) {
+                        if block.trim().is_empty() {
+                            continue;
+                        }
+
+                        let mut data_parts: Vec<String> = Vec::new();
+                        for line in block.lines() {
+                            if let Some(data) = strip_sse_field(line, "data") {
+                                data_parts.push(data.to_string());
+                            }
+                        }
+                        if data_parts.is_empty() {
+                            continue;
+                        }
+
+                        let data_str = data_parts.join("\n");
+                        if data_str.trim() == "[DONE]" {
+                            completed = true;
+                            break;
+                        }
+
+                        let event = match serde_json::from_str::<Value>(&data_str) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
+
+                        if response_id.is_empty() {
+                            response_id = event
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("resp_cc_switch_chat")
+                                .to_string();
+                        }
+                        if model.is_empty() {
+                            model = event
+                                .get("model")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        if let Some(event_usage) = event.get("usage") {
+                            usage = event_usage.clone();
+                        }
+
+                        if !started {
+                            let created = json!({
+                                "type": "response.created",
+                                "response": {
+                                    "id": response_id.clone(),
+                                    "object": "response",
+                                    "created_at": chrono::Utc::now().timestamp(),
+                                    "model": model.clone(),
+                                    "status": "in_progress",
+                                    "output": [],
+                                    "usage": build_responses_usage_from_openai_chat(Some(&usage))
+                                }
+                            });
+                            yield Ok(Bytes::from(format!("event: response.created\ndata: {}\n\n", serde_json::to_string(&created).unwrap_or_default())));
+
+                            let item = json!({
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "id": format!("{}_message_0", response_id),
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": []
+                                }
+                            });
+                            yield Ok(Bytes::from(format!("event: response.output_item.added\ndata: {}\n\n", serde_json::to_string(&item).unwrap_or_default())));
+
+                            let part = json!({
+                                "type": "response.content_part.added",
+                                "output_index": 0,
+                                "item_id": format!("{}_message_0", response_id),
+                                "content_index": 0,
+                                "part": {
+                                    "type": "output_text",
+                                    "text": "",
+                                    "annotations": []
+                                }
+                            });
+                            yield Ok(Bytes::from(format!("event: response.content_part.added\ndata: {}\n\n", serde_json::to_string(&part).unwrap_or_default())));
+                            started = true;
+                        }
+
+                        if let Some(delta) = event
+                            .get("choices")
+                            .and_then(|value| value.as_array())
+                            .and_then(|choices| choices.first())
+                            .and_then(|choice| choice.get("delta"))
+                            .and_then(|delta| delta.get("content"))
+                            .and_then(|value| value.as_str())
+                        {
+                            if !delta.is_empty() {
+                                text.push_str(delta);
+                                let payload = json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": format!("{}_message_0", response_id),
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": delta
+                                });
+                                yield Ok(Bytes::from(format!("event: response.output_text.delta\ndata: {}\n\n", serde_json::to_string(&payload).unwrap_or_default())));
+                            }
+                        }
+                    }
+
+                    if completed {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(error.to_string()));
+                    break;
+                }
+            }
+        }
+
+        if !started {
+            response_id = if response_id.is_empty() {
+                "resp_cc_switch_chat".to_string()
+            } else {
+                response_id
+            };
+            let created = json!({
+                "type": "response.created",
+                "response": {
+                    "id": response_id.clone(),
+                    "object": "response",
+                    "created_at": chrono::Utc::now().timestamp(),
+                    "model": model.clone(),
+                    "status": "in_progress",
+                    "output": [],
+                    "usage": build_responses_usage_from_openai_chat(Some(&usage))
+                }
+            });
+            yield Ok(Bytes::from(format!("event: response.created\ndata: {}\n\n", serde_json::to_string(&created).unwrap_or_default())));
+        }
+
+        let item_id = format!("{}_message_0", response_id);
+        let text_done = json!({
+            "type": "response.output_text.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text
+        });
+        yield Ok(Bytes::from(format!("event: response.output_text.done\ndata: {}\n\n", serde_json::to_string(&text_done).unwrap_or_default())));
+
+        let part_done = json!({
+            "type": "response.content_part.done",
+            "item_id": text_done["item_id"],
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": text_done["text"],
+                "annotations": []
+            }
+        });
+        yield Ok(Bytes::from(format!("event: response.content_part.done\ndata: {}\n\n", serde_json::to_string(&part_done).unwrap_or_default())));
+
+        let item_done = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "id": text_done["item_id"],
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text_done["text"],
+                    "annotations": []
+                }]
+            }
+        });
+        yield Ok(Bytes::from(format!("event: response.output_item.done\ndata: {}\n\n", serde_json::to_string(&item_done).unwrap_or_default())));
+
+        let completed_response = json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "object": "response",
+                "created_at": chrono::Utc::now().timestamp(),
+                "model": model,
+                "status": "completed",
+                "output": [item_done["item"].clone()],
+                "usage": build_responses_usage_from_openai_chat(Some(&usage))
+            }
+        });
+        yield Ok(Bytes::from(format!("event: response.completed\ndata: {}\n\n", serde_json::to_string(&completed_response).unwrap_or_default())));
+    }
+}
+
+pub fn create_responses_sse_stream_from_anthropic_with_history<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    request_messages: Vec<Value>,
+    history_recorder: Option<AnthropicHistoryRecorder>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut message_id = String::new();
+        let mut model = String::new();
+        let mut output_index: u32 = 0;
+        let mut active_text: Option<(String, u32, String)> = None;
+        let mut active_tool: Option<(String, String, String, String, u32)> = None;
+        let mut active_reasoning: Option<(u32, String)> = None;
+        let mut final_content: Vec<Value> = Vec::new();
+        let mut raw_usage = json!({});
+        let mut stop_reason: Option<String> = None;
+
+        tokio::pin!(stream);
+
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+
+                    while let Some(block) = take_sse_block(&mut buffer) {
+                        if block.trim().is_empty() {
+                            continue;
+                        }
+
+                        let mut event_name: Option<String> = None;
+                        let mut data_parts: Vec<String> = Vec::new();
+                        for line in block.lines() {
+                            if let Some(evt) = strip_sse_field(line, "event") {
+                                event_name = Some(evt.trim().to_string());
+                            } else if let Some(data) = strip_sse_field(line, "data") {
+                                data_parts.push(data.to_string());
+                            }
+                        }
+
+                        if data_parts.is_empty() {
+                            continue;
+                        }
+
+                        let data_str = data_parts.join("\n");
+                        let event = match serde_json::from_str::<Value>(&data_str) {
+                            Ok(value) => value,
+                            Err(_) => continue,
+                        };
+                        let event_type = event_name
+                            .as_deref()
+                            .or_else(|| event.get("type").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+
+                        match event_type {
+                            "message_start" => {
+                                let message = event.get("message").unwrap_or(&event);
+                                message_id = message.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                model = message.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                raw_usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
+
+                                let created = json!({
+                                    "type": "response.created",
+                                    "response": {
+                                        "id": message_id.clone(),
+                                        "object": "response",
+                                        "created_at": chrono::Utc::now().timestamp(),
+                                        "model": model.clone(),
+                                        "status": "in_progress",
+                                        "output": [],
+                                        "usage": build_responses_usage_from_anthropic(Some(&raw_usage))
+                                    }
+                                });
+                                yield Ok(Bytes::from(format!("event: response.created\ndata: {}\n\n", serde_json::to_string(&created).unwrap_or_default())));
+                            }
+                            "content_block_start" => {
+                                let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                if let Some(content_block) = event.get("content_block") {
+                                    match content_block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                        "text" => {
+                                            let item_id = format!("{}_message_{}", message_id, output_index);
+                                            active_text = Some((item_id.clone(), index, String::new()));
+                                            let item = json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": item_id,
+                                                    "type": "message",
+                                                    "status": "in_progress",
+                                                    "role": "assistant",
+                                                    "content": []
+                                                }
+                                            });
+                                            yield Ok(Bytes::from(format!("event: response.output_item.added\ndata: {}\n\n", serde_json::to_string(&item).unwrap_or_default())));
+
+                                            let part = json!({
+                                                "type": "response.content_part.added",
+                                                "output_index": output_index,
+                                                "item_id": active_text.as_ref().map(|v| v.0.clone()).unwrap_or_default(),
+                                                "content_index": index,
+                                                "part": {
+                                                    "type": "output_text",
+                                                    "text": "",
+                                                    "annotations": []
+                                                }
+                                            });
+                                            yield Ok(Bytes::from(format!("event: response.content_part.added\ndata: {}\n\n", serde_json::to_string(&part).unwrap_or_default())));
+                                        }
+                                        "tool_use" => {
+                                            let call_id = content_block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let name = content_block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                            let item_id = format!("fc_{call_id}");
+                                            active_tool = Some((item_id.clone(), call_id.clone(), name.clone(), String::new(), output_index));
+                                            let item = json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": output_index,
+                                                "item": {
+                                                    "id": item_id,
+                                                    "type": "function_call",
+                                                    "status": "in_progress",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "arguments": ""
+                                                }
+                                            });
+                                            yield Ok(Bytes::from(format!("event: response.output_item.added\ndata: {}\n\n", serde_json::to_string(&item).unwrap_or_default())));
+                                        }
+                                        "thinking" => {
+                                            active_reasoning = Some((index, String::new()));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            "content_block_delta" => {
+                                if let Some(delta) = event.get("delta") {
+                                    match delta.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                        "text_delta" => {
+                                            if let (Some(text), Some((item_id, index, acc))) = (
+                                                delta.get("text").and_then(|v| v.as_str()),
+                                                active_text.as_mut(),
+                                            ) {
+                                                acc.push_str(text);
+                                                let payload = json!({
+                                                    "type": "response.output_text.delta",
+                                                    "item_id": item_id,
+                                                    "output_index": output_index,
+                                                    "content_index": *index,
+                                                    "delta": text
+                                                });
+                                                yield Ok(Bytes::from(format!("event: response.output_text.delta\ndata: {}\n\n", serde_json::to_string(&payload).unwrap_or_default())));
+                                            }
+                                        }
+                                        "input_json_delta" => {
+                                            if let (Some(partial), Some((item_id, _call_id, _name, arguments, tool_output_index))) = (
+                                                delta.get("partial_json").and_then(|v| v.as_str()),
+                                                active_tool.as_mut(),
+                                            ) {
+                                                arguments.push_str(partial);
+                                                let payload = json!({
+                                                    "type": "response.function_call_arguments.delta",
+                                                    "item_id": item_id,
+                                                    "output_index": *tool_output_index,
+                                                    "delta": partial
+                                                });
+                                                yield Ok(Bytes::from(format!("event: response.function_call_arguments.delta\ndata: {}\n\n", serde_json::to_string(&payload).unwrap_or_default())));
+                                            }
+                                        }
+                                        "thinking_delta" => {
+                                            if let (Some(thinking), Some((_index, acc))) = (
+                                                delta.get("thinking").and_then(|v| v.as_str()),
+                                                active_reasoning.as_mut(),
+                                            ) {
+                                                acc.push_str(thinking);
+                                                let payload = json!({
+                                                    "type": "response.reasoning.delta",
+                                                    "delta": thinking
+                                                });
+                                                yield Ok(Bytes::from(format!("event: response.reasoning.delta\ndata: {}\n\n", serde_json::to_string(&payload).unwrap_or_default())));
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            "message_delta" => {
+                                if let Some(delta) = event.get("delta") {
+                                    stop_reason = delta.get("stop_reason").and_then(|v| v.as_str()).map(ToString::to_string);
+                                }
+                                if let Some(usage) = event.get("usage").and_then(|v| v.as_object()) {
+                                    if let Some(map) = raw_usage.as_object_mut() {
+                                        for (key, value) in usage {
+                                            map.insert(key.clone(), value.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            "content_block_stop" => {
+                                if let Some((item_id, index, text)) = active_text.take() {
+                                    let done = json!({
+                                        "type": "response.output_text.done",
+                                        "item_id": item_id,
+                                        "output_index": output_index,
+                                        "content_index": index,
+                                        "text": text
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.output_text.done\ndata: {}\n\n", serde_json::to_string(&done).unwrap_or_default())));
+
+                                    let part_done = json!({
+                                        "type": "response.content_part.done",
+                                        "item_id": done["item_id"],
+                                        "output_index": output_index,
+                                        "content_index": index,
+                                        "part": {
+                                            "type": "output_text",
+                                            "text": text,
+                                            "annotations": []
+                                        }
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.content_part.done\ndata: {}\n\n", serde_json::to_string(&part_done).unwrap_or_default())));
+
+                                    final_content.push(json!({ "type": "text", "text": part_done["part"]["text"] }));
+                                    let item_done = json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": output_index,
+                                        "item": {
+                                            "id": done["item_id"],
+                                            "type": "message",
+                                            "status": "completed",
+                                            "role": "assistant",
+                                            "content": [{
+                                                "type": "output_text",
+                                                "text": done["text"],
+                                                "annotations": []
+                                            }]
+                                        }
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.output_item.done\ndata: {}\n\n", serde_json::to_string(&item_done).unwrap_or_default())));
+                                    output_index += 1;
+                                } else if let Some((item_id, call_id, name, arguments, tool_output_index)) = active_tool.take() {
+                                    let parsed = serde_json::from_str::<Value>(&arguments).unwrap_or_else(|_| json!({}));
+                                    final_content.push(json!({
+                                        "type": "tool_use",
+                                        "id": call_id,
+                                        "name": name,
+                                        "input": parsed
+                                    }));
+
+                                    let args_done = json!({
+                                        "type": "response.function_call_arguments.done",
+                                        "item_id": item_id,
+                                        "output_index": tool_output_index
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.function_call_arguments.done\ndata: {}\n\n", serde_json::to_string(&args_done).unwrap_or_default())));
+
+                                    let item_done = json!({
+                                        "type": "response.output_item.done",
+                                        "output_index": tool_output_index,
+                                        "item": {
+                                            "id": item_id,
+                                            "type": "function_call",
+                                            "status": "completed",
+                                            "call_id": final_content.last().and_then(|v| v.get("id")).cloned().unwrap_or(json!("")),
+                                            "name": final_content.last().and_then(|v| v.get("name")).cloned().unwrap_or(json!("")),
+                                            "arguments": serde_json::to_string(final_content.last().and_then(|v| v.get("input")).unwrap_or(&json!({}))).unwrap_or_else(|_| "{}".to_string())
+                                        }
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.output_item.done\ndata: {}\n\n", serde_json::to_string(&item_done).unwrap_or_default())));
+                                    output_index += 1;
+                                } else if let Some((_index, thinking)) = active_reasoning.take() {
+                                    if !thinking.is_empty() {
+                                        final_content.push(json!({ "type": "thinking", "thinking": thinking }));
+                                    }
+                                    let payload = json!({
+                                        "type": "response.reasoning.done"
+                                    });
+                                    yield Ok(Bytes::from(format!("event: response.reasoning.done\ndata: {}\n\n", serde_json::to_string(&payload).unwrap_or_default())));
+                                }
+                            }
+                            "message_stop" => {
+                                if let Some(recorder) = history_recorder.as_ref() {
+                                    let history_content: Vec<Value> = final_content
+                                        .iter()
+                                        .filter(|block| {
+                                            block.get("type").and_then(|value| value.as_str())
+                                                != Some("thinking")
+                                        })
+                                        .cloned()
+                                        .collect();
+                                    if !message_id.is_empty() && !history_content.is_empty() {
+                                        let mut history = request_messages.clone();
+                                        history.push(json!({
+                                            "role": "assistant",
+                                            "content": history_content
+                                        }));
+                                        recorder(message_id.clone(), history);
+                                    }
+                                }
+
+                                let final_response = anthropic_response_to_responses(json!({
+                                    "id": message_id.clone(),
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "model": model.clone(),
+                                    "content": final_content.clone(),
+                                    "stop_reason": stop_reason.clone().unwrap_or_else(|| "end_turn".to_string()),
+                                    "usage": raw_usage.clone()
+                                })).unwrap_or_else(|_| json!({
+                                    "id": message_id.clone(),
+                                    "object": "response",
+                                    "created_at": chrono::Utc::now().timestamp(),
+                                    "model": model.clone(),
+                                    "status": "completed",
+                                    "output": [],
+                                    "usage": build_responses_usage_from_anthropic(Some(&raw_usage))
+                                }));
+
+                                let completed = json!({
+                                    "type": "response.completed",
+                                    "response": final_response
+                                });
+                                yield Ok(Bytes::from(format!("event: response.completed\ndata: {}\n\n", serde_json::to_string(&completed).unwrap_or_default())));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(error) => {
+                    yield Err(std::io::Error::other(error.to_string()));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1636,40 @@ mod tests {
             !merged.contains('\u{FFFD}'),
             "output must not contain U+FFFD replacement characters"
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_anthropic_to_responses_emits_completed_usage() {
+        let input = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ds\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"deepseek-v3.2\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":60}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":12}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+
+        let upstream = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(
+            input.as_bytes().to_vec(),
+        ))]);
+        let converted = create_responses_sse_stream_from_anthropic(upstream);
+        let chunks: Vec<_> = converted.collect().await;
+        let merged = chunks
+            .into_iter()
+            .map(|c| String::from_utf8_lossy(c.unwrap().as_ref()).to_string())
+            .collect::<String>();
+
+        assert!(merged.contains("event: response.created"));
+        assert!(merged.contains("event: response.output_text.delta"));
+        assert!(merged.contains("event: response.completed"));
+        assert!(merged.contains("\"cached_tokens\":60"));
+        assert!(merged.contains("\"output_tokens\":12"));
+        assert!(merged.contains("\"delta\":\"你好\""));
     }
 }

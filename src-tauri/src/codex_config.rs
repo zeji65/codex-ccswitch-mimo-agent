@@ -11,6 +11,10 @@ use std::fs;
 use std::path::Path;
 use toml_edit::DocumentMut;
 
+/// Fixed Codex model provider id used while CC Switch owns the local proxy route.
+pub const CODEX_PROXY_PROVIDER_ID: &str = "cc_switch_proxy";
+const CODEX_PROXY_PROVIDER_NAME: &str = "CC Switch Proxy";
+
 /// 获取 Codex 配置目录路径
 pub fn get_codex_config_dir() -> PathBuf {
     if let Some(custom) = crate::settings::get_codex_override_dir() {
@@ -130,6 +134,75 @@ pub fn validate_config_toml(text: &str) -> Result<(), AppError> {
         .map_err(|e| AppError::toml(Path::new("config.toml"), e))
 }
 
+/// Read the top-level `model` from a Codex config.toml string.
+///
+/// Profile/provider-scoped `model` values are intentionally ignored because
+/// Codex sends the active request model from the top-level/default selection.
+pub fn extract_codex_toml_model(toml_str: &str) -> Option<String> {
+    let doc = toml_str.parse::<DocumentMut>().ok()?;
+    doc.get("model")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Rewrite Codex config.toml so the official Responses client talks to CC Switch.
+///
+/// This keeps user config such as MCP/profile sections intact, but replaces the
+/// active model provider with a stable local provider that uses the officially
+/// supported `responses` wire API.
+pub fn update_codex_toml_for_proxy_provider(
+    toml_str: &str,
+    proxy_base_url: &str,
+    model: Option<&str>,
+) -> Result<String, String> {
+    let mut doc = if toml_str.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        toml_str
+            .parse::<DocumentMut>()
+            .map_err(|e| format!("TOML parse error: {e}"))?
+    };
+
+    let model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| extract_codex_toml_model(toml_str));
+
+    doc["model_provider"] = toml_edit::value(CODEX_PROXY_PROVIDER_ID);
+    if let Some(model) = model {
+        doc["model"] = toml_edit::value(model);
+    }
+
+    if doc.get("model_providers").is_none() || !doc["model_providers"].is_table() {
+        doc["model_providers"] = toml_edit::table();
+    }
+
+    let model_providers = doc["model_providers"]
+        .as_table_mut()
+        .ok_or_else(|| "model_providers must be a TOML table".to_string())?;
+
+    if !model_providers.contains_key(CODEX_PROXY_PROVIDER_ID) {
+        model_providers[CODEX_PROXY_PROVIDER_ID] = toml_edit::table();
+    }
+    if !model_providers[CODEX_PROXY_PROVIDER_ID].is_table() {
+        model_providers[CODEX_PROXY_PROVIDER_ID] = toml_edit::table();
+    }
+
+    let proxy_provider = model_providers[CODEX_PROXY_PROVIDER_ID]
+        .as_table_mut()
+        .ok_or_else(|| "cc_switch_proxy provider must be a TOML table".to_string())?;
+
+    proxy_provider["name"] = toml_edit::value(CODEX_PROXY_PROVIDER_NAME);
+    proxy_provider["base_url"] = toml_edit::value(proxy_base_url.trim_end_matches('/'));
+    proxy_provider["wire_api"] = toml_edit::value("responses");
+    proxy_provider["requires_openai_auth"] = toml_edit::value(true);
+
+    Ok(doc.to_string())
+}
+
 /// 读取并校验 `~/.codex/config.toml`，返回文本（可能为空）
 pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
     let s = read_codex_config_text()?;
@@ -145,6 +218,7 @@ pub fn read_and_validate_codex_config_text() -> Result<String, AppError> {
 /// - `"model"`: writes to top-level `model` field.
 ///
 /// Empty value removes the field.
+#[allow(dead_code)]
 pub fn update_codex_toml_field(toml_str: &str, field: &str, value: &str) -> Result<String, String> {
     let mut doc = toml_str
         .parse::<DocumentMut>()
@@ -466,5 +540,78 @@ base_url = "https://production.api/v1"
             .and_then(|v| v.get("base_url"))
             .and_then(|v| v.as_str());
         assert_eq!(base_url, Some("https://production.api/v1"));
+    }
+
+    #[test]
+    fn proxy_provider_rewrite_uses_official_model_provider_shape() {
+        let input = r#"model_provider = "xiaomi_mimo"
+model = "mimo-v2-pro"
+disable_response_storage = true
+
+[model_providers.xiaomi_mimo]
+name = "xiaomi_mimo"
+base_url = "https://api.xiaomimimo.com/anthropic"
+wire_api = "responses"
+requires_openai_auth = true
+
+[mcp_servers.echo]
+command = "echo"
+"#;
+
+        let result = update_codex_toml_for_proxy_provider(
+            input,
+            "http://127.0.0.1:15721/v1",
+            Some("deepseek-v3.2"),
+        )
+        .expect("rewrite should succeed");
+        let parsed: toml::Value = toml::from_str(&result).expect("valid TOML");
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some(CODEX_PROXY_PROVIDER_ID)
+        );
+        assert_eq!(
+            parsed.get("model").and_then(|v| v.as_str()),
+            Some("deepseek-v3.2")
+        );
+
+        let proxy_provider = parsed
+            .get("model_providers")
+            .and_then(|v| v.get(CODEX_PROXY_PROVIDER_ID))
+            .expect("proxy provider exists");
+        assert_eq!(
+            proxy_provider.get("base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:15721/v1")
+        );
+        assert_eq!(
+            proxy_provider.get("wire_api").and_then(|v| v.as_str()),
+            Some("responses")
+        );
+        assert_eq!(
+            proxy_provider
+                .get("requires_openai_auth")
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            parsed.get("mcp_servers").is_some(),
+            "MCP servers should be preserved"
+        );
+    }
+
+    #[test]
+    fn extract_codex_toml_model_reads_only_top_level_model() {
+        let input = r#"[profiles.default]
+model = "profile-model"
+
+[model_providers.custom]
+model = "provider-model"
+"#;
+
+        assert_eq!(extract_codex_toml_model(input), None);
+        assert_eq!(
+            extract_codex_toml_model("model = \"gpt-5-codex\"\n").as_deref(),
+            Some("gpt-5-codex")
+        );
     }
 }

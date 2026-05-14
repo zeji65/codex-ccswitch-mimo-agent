@@ -2,6 +2,7 @@
  * Codex 预设供应商配置模板
  */
 import { ProviderCategory } from "../types";
+import type { ClaudeApiFormat } from "../types";
 import type { PresetTheme } from "./claudeProviderPresets";
 
 export interface CodexProviderPreset {
@@ -17,8 +18,11 @@ export interface CodexProviderPreset {
   partnerPromotionKey?: string; // 合作伙伴促销信息的 i18n key
   category?: ProviderCategory; // 新增：分类
   isCustomTemplate?: boolean; // 标识是否为自定义模板
+  providerType?: string; // 特殊供应商类型
   // 新增：请求地址候选列表（用于地址管理/测速）
   endpointCandidates?: string[];
+  // 上游协议格式（第三方桥接用）
+  apiFormat?: ClaudeApiFormat;
   // 新增：视觉主题配置
   theme?: PresetTheme;
   // 图标配置
@@ -62,6 +66,46 @@ wire_api = "responses"
 requires_openai_auth = true`;
 }
 
+export function generateBridgeConfig(
+  providerName: string,
+  baseUrl: string,
+  modelName: string,
+): string {
+  const cleanProviderName =
+    providerName
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, "_")
+      .replace(/^_+|_+$/g, "") || "custom";
+
+  return `model_provider = "${cleanProviderName}"
+model = "${modelName}"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.${cleanProviderName}]
+name = "${cleanProviderName}"
+base_url = "${baseUrl}"
+wire_api = "responses"
+requires_openai_auth = true
+model_context_window = 1000000
+model_auto_compact_token_limit = 9000000`;
+}
+
+export function generateLiteLLMGatewayConfig(modelName: string): string {
+  return `model_provider = "cc_switch_litellm"
+model = "${modelName}"
+model_reasoning_effort = "high"
+disable_response_storage = true
+
+[model_providers.cc_switch_litellm]
+name = "cc_switch_litellm"
+base_url = "http://localhost:4000/v1"
+wire_api = "responses"
+requires_openai_auth = true
+model_context_window = 1000000
+model_auto_compact_token_limit = 9000000`;
+}
+
 export const codexProviderPresets: CodexProviderPreset[] = [
   {
     name: "OpenAI Official",
@@ -93,6 +137,83 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     isPartner: true,
     partnerPromotionKey: "shengsuanyun",
     icon: "shengsuanyun",
+  },
+  {
+    name: "DeepSeek",
+    websiteUrl: "https://platform.deepseek.com",
+    apiKeyUrl: "https://platform.deepseek.com/api_keys",
+    auth: generateThirdPartyAuth(""),
+    config: generateBridgeConfig(
+      "deepseek",
+      "https://api.deepseek.com/anthropic",
+      "DeepSeek-V3.2",
+    ),
+    endpointCandidates: ["https://api.deepseek.com/anthropic"],
+    category: "cn_official",
+    apiFormat: "anthropic",
+    icon: "deepseek",
+  },
+  {
+    name: "Xiaomi MiMo",
+    websiteUrl: "https://platform.xiaomimimo.com",
+    apiKeyUrl: "https://platform.xiaomimimo.com/#/console/api-keys",
+    auth: generateThirdPartyAuth(""),
+    config: generateBridgeConfig(
+      "xiaomi_mimo",
+      "https://token-plan-cn.xiaomimimo.com/anthropic",
+      "mimo-v2-pro",
+    ),
+    endpointCandidates: [
+      "https://token-plan-cn.xiaomimimo.com/anthropic",
+      "https://api.xiaomimimo.com/anthropic",
+    ],
+    category: "cn_official",
+    apiFormat: "anthropic",
+    icon: "xiaomimimo",
+  },
+  {
+    name: "LiteLLM DeepSeek",
+    websiteUrl: "http://localhost:4000",
+    auth: generateThirdPartyAuth("sk-cc-switch-litellm"),
+    config: generateLiteLLMGatewayConfig("codex-deepseek"),
+    endpointCandidates: ["http://localhost:4000/v1"],
+    category: "cn_official",
+    providerType: "litellm_gateway",
+    apiFormat: "openai_chat",
+    icon: "deepseek",
+  },
+  {
+    name: "LiteLLM Xiaomi MiMo",
+    websiteUrl: "http://localhost:4000",
+    auth: generateThirdPartyAuth("sk-cc-switch-litellm"),
+    config: generateLiteLLMGatewayConfig("codex-mimo"),
+    endpointCandidates: ["http://localhost:4000/v1"],
+    category: "cn_official",
+    providerType: "litellm_gateway",
+    apiFormat: "openai_chat",
+    icon: "xiaomimimo",
+  },
+  {
+    name: "LiteLLM Kimi",
+    websiteUrl: "http://localhost:4000",
+    auth: generateThirdPartyAuth("sk-cc-switch-litellm"),
+    config: generateLiteLLMGatewayConfig("codex-kimi"),
+    endpointCandidates: ["http://localhost:4000/v1"],
+    category: "cn_official",
+    providerType: "litellm_gateway",
+    apiFormat: "openai_chat",
+    icon: "kimi",
+  },
+  {
+    name: "LiteLLM Qwen",
+    websiteUrl: "http://localhost:4000",
+    auth: generateThirdPartyAuth("sk-cc-switch-litellm"),
+    config: generateLiteLLMGatewayConfig("codex-qwen"),
+    endpointCandidates: ["http://localhost:4000/v1"],
+    category: "cn_official",
+    providerType: "litellm_gateway",
+    apiFormat: "openai_chat",
+    icon: "qwen",
   },
   {
     name: "Azure OpenAI",

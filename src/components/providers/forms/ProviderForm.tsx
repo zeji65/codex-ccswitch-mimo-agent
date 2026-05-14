@@ -169,6 +169,7 @@ export function ProviderForm({
     isPartner?: boolean;
     partnerPromotionKey?: string;
     suggestedDefaults?: OpenClawSuggestedDefaults;
+    providerType?: string;
   } | null>(null);
   const [isEndpointModalOpen, setIsEndpointModalOpen] = useState(false);
   const [isCodexEndpointModalOpen, setIsCodexEndpointModalOpen] =
@@ -325,9 +326,11 @@ export function ProviderForm({
     onConfigChange: handleSettingsConfigChange,
   });
 
+  const defaultApiFormatForApp: ClaudeApiFormat =
+    appId === "codex" ? "openai_responses" : "anthropic";
   const [localApiFormat, setLocalApiFormat] = useState<ClaudeApiFormat>(() => {
-    if (appId !== "claude") return "anthropic";
-    return initialData?.meta?.apiFormat ?? "anthropic";
+    if (appId !== "claude" && appId !== "codex") return "anthropic";
+    return initialData?.meta?.apiFormat ?? defaultApiFormatForApp;
   });
 
   const handleApiFormatChange = useCallback((format: ClaudeApiFormat) => {
@@ -1045,7 +1048,9 @@ export function ProviderForm({
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+      activePreset?.providerType ||
+      templatePreset?.providerType ||
+      initialData?.meta?.providerType;
 
     payload.meta = {
       ...(baseMeta ?? {}),
@@ -1093,7 +1098,7 @@ export function ProviderForm({
           ? pricingConfig.pricingModelSource
           : undefined,
       apiFormat:
-        appId === "claude" && category !== "official"
+        (appId === "claude" || appId === "codex") && category !== "official"
           ? localApiFormat
           : undefined,
       apiKeyField:
@@ -1232,6 +1237,7 @@ export function ProviderForm({
       if (appId === "codex") {
         const template = getCodexCustomTemplate();
         resetCodexConfig(template.auth, template.config);
+        setLocalApiFormat(defaultApiFormatForApp);
       }
       if (appId === "gemini") {
         resetGeminiConfig({}, {});
@@ -1257,6 +1263,7 @@ export function ProviderForm({
       category: entry.preset.category,
       isPartner: entry.preset.isPartner,
       partnerPromotionKey: entry.preset.partnerPromotionKey,
+      providerType: (entry.preset as { providerType?: string }).providerType,
     });
 
     if (appId === "codex") {
@@ -1265,6 +1272,10 @@ export function ProviderForm({
       const config = preset.config ?? "";
 
       resetCodexConfig(auth, config);
+      setLocalApiFormat(
+        (preset.apiFormat as ClaudeApiFormat | undefined) ??
+          defaultApiFormatForApp,
+      );
 
       form.reset({
         name: preset.nameKey ? t(preset.nameKey) : preset.name,
@@ -1357,7 +1368,7 @@ export function ProviderForm({
     if (preset.apiFormat) {
       setLocalApiFormat(preset.apiFormat);
     } else {
-      setLocalApiFormat("anthropic");
+      setLocalApiFormat(defaultApiFormatForApp);
     }
 
     setLocalApiKeyField(preset.apiKeyField ?? "ANTHROPIC_AUTH_TOKEN");

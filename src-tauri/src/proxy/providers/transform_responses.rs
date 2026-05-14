@@ -11,6 +11,9 @@
 use crate::proxy::error::ProxyError;
 use serde_json::{json, Value};
 
+pub(crate) const CODEX_ANTHROPIC_HISTORY_KEY: &str = "_cc_switch_anthropic_history";
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 4096;
+
 /// Anthropic 请求 → OpenAI Responses 请求
 ///
 /// `cache_key`: optional prompt_cache_key to inject for improved cache routing
@@ -84,15 +87,18 @@ pub fn anthropic_to_responses(
         let response_tools: Vec<Value> = tools
             .iter()
             .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
-            .map(|t| {
-                json!({
+            .filter_map(|t| {
+                let name = super::transform::normalize_function_name(
+                    t.get("name").and_then(|n| n.as_str()),
+                )?;
+                Some(json!({
                     "type": "function",
-                    "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "name": name,
                     "description": t.get("description"),
                     "parameters": super::transform::clean_schema(
                         t.get("input_schema").cloned().unwrap_or(json!({}))
                     )
-                })
+                }))
             })
             .collect();
 
@@ -164,6 +170,234 @@ pub fn anthropic_to_responses(
     }
 
     Ok(result)
+}
+
+/// OpenAI Responses 请求 → Anthropic Messages 请求
+pub fn responses_request_to_anthropic(body: Value) -> Result<Value, ProxyError> {
+    let mut result = json!({});
+
+    if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
+        result["model"] = json!(model);
+    }
+
+    if let Some(instructions) = body.get("instructions").and_then(|v| v.as_str()) {
+        if !instructions.is_empty() {
+            result["system"] = json!(instructions);
+        }
+    }
+
+    result["messages"] = json!(extract_anthropic_messages_from_responses_request(&body)?);
+
+    result["max_tokens"] = resolve_responses_max_tokens_for_anthropic(&body);
+    if let Some(v) = body.get("temperature") {
+        result["temperature"] = v.clone();
+    }
+    if let Some(v) = body.get("top_p") {
+        result["top_p"] = v.clone();
+    }
+    if let Some(v) = body.get("stream") {
+        result["stream"] = v.clone();
+    }
+
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let anthropic_tools: Vec<Value> = tools
+            .iter()
+            .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("image"))
+            .filter_map(|tool| {
+                let name = super::transform::normalize_function_name(
+                    tool.get("name").and_then(|n| n.as_str()),
+                )?;
+                Some(json!({
+                    "name": name,
+                    "description": tool.get("description"),
+                    "input_schema": normalize_responses_tool_schema_for_anthropic(tool)
+                }))
+            })
+            .collect();
+        if !anthropic_tools.is_empty() {
+            result["tools"] = json!(anthropic_tools);
+        }
+    }
+
+    if let Some(tool_choice) = body.get("tool_choice") {
+        result["tool_choice"] = map_tool_choice_to_anthropic(tool_choice);
+    }
+
+    Ok(result)
+}
+
+pub fn responses_request_to_openai_chat(body: Value) -> Result<Value, ProxyError> {
+    let anthropic = responses_request_to_anthropic(body)?;
+    super::transform::anthropic_to_openai(anthropic)
+}
+
+pub fn openai_chat_response_to_responses(body: Value) -> Result<Value, ProxyError> {
+    let id = body
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("resp_cc_switch_chat")
+        .to_string();
+    let model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let created_at = body
+        .get("created")
+        .and_then(|value| value.as_i64())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+    let mut output = Vec::new();
+    if let Some(choice) = body
+        .get("choices")
+        .and_then(|value| value.as_array())
+        .and_then(|choices| choices.first())
+    {
+        if let Some(message) = choice.get("message") {
+            if let Some(content) = message.get("content").and_then(|value| value.as_str()) {
+                if !content.is_empty() {
+                    output.push(json!({
+                        "id": format!("{id}_message_0"),
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": content,
+                            "annotations": []
+                        }]
+                    }));
+                }
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) {
+                for (index, call) in tool_calls.iter().enumerate() {
+                    let function = call.get("function").unwrap_or(&Value::Null);
+                    let name = function
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    if name.is_empty() {
+                        continue;
+                    }
+                    output.push(json!({
+                        "id": call
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("fc_{index}")),
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": call
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| format!("call_{index}")),
+                        "name": name,
+                        "arguments": function
+                            .get("arguments")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("{}")
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "id": id,
+        "object": "response",
+        "created_at": created_at,
+        "model": model,
+        "status": "completed",
+        "output": output,
+        "usage": build_responses_usage_from_openai_chat(body.get("usage"))
+    }))
+}
+
+pub(crate) fn build_responses_usage_from_openai_chat(usage: Option<&Value>) -> Value {
+    let input_tokens = usage
+        .and_then(|value| value.get("prompt_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let output_tokens = usage
+        .and_then(|value| value.get("completion_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total_tokens = usage
+        .and_then(|value| value.get("total_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(input_tokens + output_tokens);
+
+    json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens
+    })
+}
+
+fn resolve_responses_max_tokens_for_anthropic(body: &Value) -> Value {
+    for key in ["max_output_tokens", "max_tokens", "max_completion_tokens"] {
+        if let Some(value) = body.get(key).filter(|value| !value.is_null()) {
+            return value.clone();
+        }
+    }
+
+    json!(DEFAULT_ANTHROPIC_MAX_TOKENS)
+}
+
+fn normalize_responses_tool_schema_for_anthropic(tool: &Value) -> Value {
+    let raw_schema = tool
+        .get("parameters")
+        .or_else(|| tool.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let cleaned = super::transform::clean_schema(raw_schema);
+
+    match cleaned {
+        Value::Object(mut obj) => {
+            let schema_type = obj.get("type");
+            let type_is_object = schema_type.and_then(|value| value.as_str()) == Some("object");
+            let type_missing_or_null = schema_type.map(|value| value.is_null()).unwrap_or(true);
+
+            if type_is_object || type_missing_or_null {
+                obj.insert("type".to_string(), json!("object"));
+                if !obj.get("properties").is_some_and(|value| value.is_object()) {
+                    obj.insert("properties".to_string(), json!({}));
+                }
+                Value::Object(obj)
+            } else {
+                json!({ "type": "object", "properties": {} })
+            }
+        }
+        _ => json!({ "type": "object", "properties": {} }),
+    }
+}
+
+pub(crate) fn extract_anthropic_messages_from_responses_request(
+    body: &Value,
+) -> Result<Vec<Value>, ProxyError> {
+    let mut messages = Vec::new();
+
+    if let Some(history) = body
+        .get(CODEX_ANTHROPIC_HISTORY_KEY)
+        .and_then(|value| value.as_array())
+    {
+        messages.extend(history.iter().cloned());
+    }
+
+    if let Some(input) = body.get("input").and_then(|value| value.as_array()) {
+        messages.extend(convert_responses_input_to_messages(input)?);
+    }
+
+    if messages.is_empty() {
+        return Err(ProxyError::InvalidRequest(
+            "Codex Responses 请求没有 input，且 previous_response_id 未命中本地上下文缓存"
+                .to_string(),
+        ));
+    }
+
+    Ok(messages)
 }
 
 fn map_tool_choice_to_responses(tool_choice: &Value) -> Value {
@@ -253,6 +487,53 @@ pub(crate) fn build_anthropic_usage_from_responses(usage: Option<&Value>) -> Val
     if let Some(v) = u.get("cache_read_input_tokens") {
         result["cache_read_input_tokens"] = v.clone();
     }
+    if let Some(v) = u.get("cache_creation_input_tokens") {
+        result["cache_creation_input_tokens"] = v.clone();
+    }
+
+    result
+}
+
+pub(crate) fn build_responses_usage_from_anthropic(usage: Option<&Value>) -> Value {
+    let u = match usage {
+        Some(v) if !v.is_null() => v,
+        _ => {
+            return json!({
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0
+            })
+        }
+    };
+
+    let cached_tokens = u
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .or_else(|| u.get("prompt_cache_hit_tokens").and_then(|v| v.as_u64()))
+        .unwrap_or(0);
+
+    let prompt_cache_miss_tokens = u
+        .get("prompt_cache_miss_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let input_tokens = u
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(cached_tokens + prompt_cache_miss_tokens);
+    let output_tokens = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let mut result = json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens
+    });
+
+    if cached_tokens > 0 {
+        result["cache_read_input_tokens"] = json!(cached_tokens);
+        result["input_tokens_details"] = json!({ "cached_tokens": cached_tokens });
+    }
+
     if let Some(v) = u.get("cache_creation_input_tokens") {
         result["cache_creation_input_tokens"] = v.clone();
     }
@@ -400,6 +681,258 @@ fn convert_messages_to_input(messages: &[Value]) -> Result<Vec<Value>, ProxyErro
     }
 
     Ok(input)
+}
+
+fn convert_responses_input_to_messages(input: &[Value]) -> Result<Vec<Value>, ProxyError> {
+    let mut messages = Vec::new();
+
+    for item in input {
+        if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+            match item_type {
+                "function_call" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or_else(|| json!({}));
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": arguments
+                        }]
+                    }));
+                    continue;
+                }
+                "function_call_output" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let output = item.get("output").cloned().unwrap_or(json!(""));
+                    let anthropic_output = match output {
+                        Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(json!(s)),
+                        other => other,
+                    };
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "content": anthropic_output
+                        }]
+                    }));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        let raw_role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let role = normalize_responses_role_for_anthropic(raw_role);
+        let content = item.get("content");
+        let anthropic_content = convert_responses_content_to_blocks(content)?;
+        messages.push(json!({
+            "role": role,
+            "content": anthropic_content
+        }));
+    }
+
+    Ok(messages)
+}
+
+fn normalize_responses_role_for_anthropic(role: &str) -> &'static str {
+    match role {
+        "assistant" => "assistant",
+        _ => "user",
+    }
+}
+
+fn convert_responses_content_to_blocks(content: Option<&Value>) -> Result<Vec<Value>, ProxyError> {
+    let mut blocks = Vec::new();
+
+    match content {
+        Some(Value::String(text)) => {
+            if !text.is_empty() {
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+        }
+        Some(Value::Array(parts)) => {
+            for part in parts {
+                match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "input_text" | "output_text" | "text" => {
+                        if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                            blocks.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
+                    "input_image" => {
+                        if let Some(image_url) = part.get("image_url").and_then(|v| v.as_str()) {
+                            if let Some((media_type, data)) = parse_data_url(image_url) {
+                                blocks.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                    "refusal" => {
+                        if let Some(text) = part
+                            .get("refusal")
+                            .or_else(|| part.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            blocks.push(json!({ "type": "text", "text": text }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(Value::Object(_)) => {
+            return Err(ProxyError::TransformError(
+                "Unsupported Responses content object".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(blocks)
+}
+
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(",")?;
+    let media_type = meta.strip_suffix(";base64").unwrap_or(meta).to_string();
+    Some((media_type, data.to_string()))
+}
+
+fn map_tool_choice_to_anthropic(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(value) => match value.as_str() {
+            "required" => json!({ "type": "any" }),
+            "auto" => json!({ "type": "auto" }),
+            "none" => json!({ "type": "none" }),
+            _ => tool_choice.clone(),
+        },
+        Value::Object(obj) => match obj.get("type").and_then(|t| t.as_str()) {
+            Some("function") => json!({
+                "type": "tool",
+                "name": obj.get("name").and_then(|n| n.as_str()).unwrap_or("")
+            }),
+            _ => tool_choice.clone(),
+        },
+        _ => tool_choice.clone(),
+    }
+}
+
+/// Anthropic 响应 → OpenAI Responses 响应
+pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError> {
+    let content = body
+        .get("content")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            ProxyError::TransformError("No content in anthropic response".to_string())
+        })?;
+
+    let mut output = Vec::new();
+    let mut message_content = Vec::new();
+    let mut combined_text = String::new();
+
+    let flush_message = |output: &mut Vec<Value>, message_content: &mut Vec<Value>| {
+        if !message_content.is_empty() {
+            output.push(json!({
+                "id": format!("{}_message_{}", body.get("id").and_then(|v| v.as_str()).unwrap_or("resp"), output.len()),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": message_content.clone()
+            }));
+            message_content.clear();
+        }
+    };
+
+    for block in content {
+        match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    if !text.is_empty() {
+                        combined_text.push_str(text);
+                        message_content.push(json!({
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": []
+                        }));
+                    }
+                }
+            }
+            "tool_use" => {
+                flush_message(&mut output, &mut message_content);
+                let call_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let arguments = block.get("input").cloned().unwrap_or(json!({}));
+                output.push(json!({
+                    "id": format!("fc_{call_id}"),
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string())
+                }));
+            }
+            "thinking" => {
+                flush_message(&mut output, &mut message_content);
+                if let Some(thinking) = block.get("thinking").and_then(|v| v.as_str()) {
+                    if !thinking.is_empty() {
+                        output.push(json!({
+                            "id": format!("rs_{}", output.len()),
+                            "type": "reasoning",
+                            "status": "completed",
+                            "summary": [{
+                                "type": "summary_text",
+                                "text": thinking
+                            }]
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_message(&mut output, &mut message_content);
+
+    let stop_reason = body.get("stop_reason").and_then(|v| v.as_str());
+    let status = if stop_reason == Some("max_tokens") {
+        "incomplete"
+    } else {
+        "completed"
+    };
+
+    let mut result = json!({
+        "id": body.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "object": "response",
+        "created_at": chrono::Utc::now().timestamp(),
+        "model": body.get("model").and_then(|v| v.as_str()).unwrap_or(""),
+        "status": status,
+        "output": output,
+        "usage": build_responses_usage_from_anthropic(body.get("usage"))
+    });
+
+    if !combined_text.is_empty() {
+        result["output_text"] = json!(combined_text);
+    }
+
+    if status == "incomplete" {
+        result["incomplete_details"] = json!({
+            "reason": "max_output_tokens"
+        });
+    }
+
+    Ok(result)
 }
 
 /// OpenAI Responses 响应 → Anthropic 响应
@@ -1324,6 +1857,241 @@ mod tests {
         assert!(
             result.get("tools").is_none(),
             "非 Codex OAuth 路径下 tools 在客户端未送时不应被注入"
+        );
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_maps_instructions_and_tools() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "instructions": "You are a careful coding assistant.",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "帮我看一下这个 diff" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "name": "read_file"
+            },
+            "stream": true
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["model"], json!("deepseek-v3.2"));
+        assert_eq!(result["max_tokens"], json!(DEFAULT_ANTHROPIC_MAX_TOKENS));
+        assert_eq!(
+            result["system"],
+            json!("You are a careful coding assistant.")
+        );
+        assert_eq!(result["stream"], json!(true));
+        assert_eq!(result["messages"][0]["role"], json!("user"));
+        assert_eq!(result["messages"][0]["content"][0]["type"], json!("text"));
+        assert_eq!(
+            result["messages"][0]["content"][0]["text"],
+            json!("帮我看一下这个 diff")
+        );
+        assert_eq!(result["tools"][0]["name"], json!("read_file"));
+        assert_eq!(result["tool_choice"]["type"], json!("tool"));
+        assert_eq!(result["tool_choice"]["name"], json!("read_file"));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_fixes_null_tool_schema() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "patch it" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "parameters": { "type": null }
+            }],
+            "stream": true
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["tools"][0]["name"], json!("apply_patch"));
+        assert_eq!(result["tools"][0]["input_schema"]["type"], json!("object"));
+        assert_eq!(result["tools"][0]["input_schema"]["properties"], json!({}));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_defaults_missing_tool_schema() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "patch it" }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "apply_patch",
+                "description": "Apply a patch",
+                "parameters": null
+            }],
+            "stream": true
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["tools"][0]["input_schema"]["type"], json!("object"));
+        assert_eq!(result["tools"][0]["input_schema"]["properties"], json!({}));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_skips_empty_tool_names() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "use tools" }]
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "",
+                    "description": "Invalid empty tool",
+                    "parameters": { "type": "object" }
+                },
+                {
+                    "type": "function",
+                    "name": "valid/tool",
+                    "description": "Valid after normalization",
+                    "parameters": { "type": "object" }
+                }
+            ],
+            "stream": true
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        let tools = result["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!("valid_tool"));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_normalizes_codex_roles() {
+        let input = json!({
+            "model": "mimo-v2-pro",
+            "input": [
+                {
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": "Be concise." }]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "ping" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "pong" }]
+                }
+            ],
+            "stream": true
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], json!("user"));
+        assert_eq!(
+            result["messages"][0]["content"][0]["text"],
+            json!("Be concise.")
+        );
+        assert_eq!(result["messages"][1]["role"], json!("user"));
+        assert_eq!(result["messages"][2]["role"], json!("assistant"));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_maps_max_output_tokens() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "max_output_tokens": 1234,
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "ping" }]
+            }]
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["max_tokens"], json!(1234));
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_defaults_missing_max_tokens() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "ping" }]
+            }]
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["max_tokens"], json!(DEFAULT_ANTHROPIC_MAX_TOKENS));
+    }
+
+    #[test]
+    fn test_anthropic_response_to_responses_maps_cache_usage_and_tool_calls() {
+        let input = json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "deepseek-v3.2",
+            "content": [
+                { "type": "text", "text": "先读文件。" },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "read_file",
+                    "input": { "path": "/tmp/demo.ts" }
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 18,
+                "prompt_cache_hit_tokens": 80
+            }
+        });
+
+        let result = anthropic_response_to_responses(input).unwrap();
+
+        assert_eq!(result["id"], json!("msg_123"));
+        assert_eq!(result["model"], json!("deepseek-v3.2"));
+        assert_eq!(result["status"], json!("completed"));
+        assert_eq!(result["output"][0]["type"], json!("message"));
+        assert_eq!(
+            result["output"][0]["content"][0]["type"],
+            json!("output_text")
+        );
+        assert_eq!(result["output"][1]["type"], json!("function_call"));
+        assert_eq!(result["output"][1]["call_id"], json!("toolu_1"));
+        assert_eq!(result["output"][1]["name"], json!("read_file"));
+        assert_eq!(result["usage"]["input_tokens"], json!(120));
+        assert_eq!(result["usage"]["output_tokens"], json!(18));
+        assert_eq!(result["usage"]["cache_read_input_tokens"], json!(80));
+        assert_eq!(
+            result["usage"]["input_tokens_details"]["cached_tokens"],
+            json!(80)
         );
     }
 }

@@ -911,24 +911,34 @@ impl RequestForwarder {
                 }
             }
         }
-        let resolved_claude_api_format = if adapter.name() == "Claude" {
+        let resolved_api_format = if adapter.name() == "Claude" {
             Some(
                 self.resolve_claude_api_format(provider, &mapped_body, is_copilot)
                     .await,
             )
+        } else if adapter.name() == "Codex" {
+            Some(super::providers::get_codex_api_format(provider).to_string())
         } else {
             None
         };
-        let needs_transform = match resolved_claude_api_format.as_deref() {
-            Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
-            None => adapter.needs_transform(provider),
+        let needs_transform = if adapter.name() == "Claude" {
+            resolved_api_format
+                .as_deref()
+                .is_some_and(super::providers::claude_api_format_needs_transform)
+        } else {
+            adapter.needs_transform(provider)
         };
         let (effective_endpoint, passthrough_query) =
             if needs_transform && adapter.name() == "Claude" {
-                let api_format = resolved_claude_api_format
+                let api_format = resolved_api_format
                     .as_deref()
                     .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
                 rewrite_claude_transform_endpoint(endpoint, api_format, is_copilot, &mapped_body)
+            } else if needs_transform && adapter.name() == "Codex" {
+                let api_format = resolved_api_format
+                    .as_deref()
+                    .unwrap_or_else(|| super::providers::get_codex_api_format(provider));
+                rewrite_codex_transform_endpoint(endpoint, api_format)
             } else {
                 (
                     endpoint.to_string(),
@@ -938,13 +948,16 @@ impl RequestForwarder {
                 )
             };
 
-        let url = if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
+        let is_codex_anthropic_bridge = adapter.name() == "Codex"
+            && matches!(resolved_api_format.as_deref(), Some("anthropic"));
+
+        let url = if matches!(resolved_api_format.as_deref(), Some("gemini_native")) {
             super::gemini_url::resolve_gemini_native_url(
                 &base_url,
                 &effective_endpoint,
                 is_full_url,
             )
-        } else if is_full_url {
+        } else if is_full_url && !is_codex_anthropic_bridge {
             append_query_to_full_url(&base_url, passthrough_query.as_deref())
         } else {
             adapter.build_url(&base_url, &effective_endpoint)
@@ -953,7 +966,7 @@ impl RequestForwarder {
         // 转换请求体（如果需要）
         let request_body = if needs_transform {
             if adapter.name() == "Claude" {
-                let api_format = resolved_claude_api_format
+                let api_format = resolved_api_format
                     .as_deref()
                     .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
                 super::providers::transform_claude_request_for_api_format(
@@ -1161,8 +1174,9 @@ impl RequestForwarder {
             .ok()
             .and_then(|u| u.authority().map(|a| a.to_string()));
 
-        let should_send_anthropic_headers = adapter.name() == "Claude"
-            && matches!(resolved_claude_api_format.as_deref(), Some("anthropic"));
+        let should_send_anthropic_headers = (adapter.name() == "Claude"
+            || adapter.name() == "Codex")
+            && matches!(resolved_api_format.as_deref(), Some("anthropic"));
 
         // 预计算 anthropic-beta 值（仅 Claude）
         let anthropic_beta_value = if should_send_anthropic_headers {
@@ -1243,6 +1257,7 @@ impl RequestForwarder {
             // --- 认证类 — 用 adapter 提供的认证头替换（在原始位置） ---
             if key_str.eq_ignore_ascii_case("authorization")
                 || key_str.eq_ignore_ascii_case("x-api-key")
+                || key_str.eq_ignore_ascii_case("api-key")
                 || key_str.eq_ignore_ascii_case("x-goog-api-key")
             {
                 if !saw_auth {
@@ -1424,7 +1439,7 @@ impl RequestForwarder {
         let status = response.status();
 
         if status.is_success() {
-            Ok((response, resolved_claude_api_format))
+            Ok((response, resolved_api_format))
         } else {
             let status_code = status.as_u16();
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
@@ -1734,6 +1749,31 @@ fn rewrite_claude_transform_endpoint(
     (rewritten, passthrough_query)
 }
 
+fn rewrite_codex_transform_endpoint(endpoint: &str, api_format: &str) -> (String, Option<String>) {
+    let (path, query) = split_endpoint_and_query(endpoint);
+    let passthrough_query = query.map(ToString::to_string);
+
+    let target_path = match api_format {
+        "anthropic" => match path {
+            "/responses" | "/v1/responses" | "/codex/v1/responses" => Some("/v1/messages"),
+            _ => None,
+        },
+        "openai_chat" => match path {
+            "/responses" | "/v1/responses" | "/codex/v1/responses" => Some("/v1/chat/completions"),
+            _ => None,
+        },
+        _ => return (endpoint.to_string(), passthrough_query),
+    };
+
+    let rewritten = match (target_path, passthrough_query.as_deref()) {
+        (Some(path), Some(query)) if !query.is_empty() => format!("{path}?{query}"),
+        (Some(path), _) => path.to_string(),
+        (None, _) => endpoint.to_string(),
+    };
+
+    (rewritten, passthrough_query)
+}
+
 fn merge_query_params(base_query: Option<&str>, extra_param: Option<&str>) -> Option<String> {
     let mut params: Vec<String> = base_query
         .into_iter()
@@ -1980,6 +2020,24 @@ mod tests {
         let url = append_query_to_full_url("https://relay.example/api?foo=bar", Some("x-id=1"));
 
         assert_eq!(url, "https://relay.example/api?foo=bar&x-id=1");
+    }
+
+    #[test]
+    fn rewrite_codex_transform_endpoint_maps_responses_to_messages() {
+        let (endpoint, passthrough_query) =
+            rewrite_codex_transform_endpoint("/v1/responses?trace=1", "anthropic");
+
+        assert_eq!(endpoint, "/v1/messages?trace=1");
+        assert_eq!(passthrough_query.as_deref(), Some("trace=1"));
+    }
+
+    #[test]
+    fn rewrite_codex_transform_endpoint_keeps_compact_path_unchanged() {
+        let (endpoint, passthrough_query) =
+            rewrite_codex_transform_endpoint("/v1/responses/compact?trace=1", "anthropic");
+
+        assert_eq!(endpoint, "/v1/responses/compact?trace=1");
+        assert_eq!(passthrough_query.as_deref(), Some("trace=1"));
     }
 
     #[test]

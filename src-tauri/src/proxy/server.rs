@@ -38,6 +38,9 @@ pub struct ProxyState {
     pub provider_router: Arc<ProviderRouter>,
     /// Gemini Native shadow state，用于 thoughtSignature / tool call 回放
     pub gemini_shadow: Arc<GeminiShadowStore>,
+    /// Codex Responses -> Anthropic bridge history keyed by provider + response id.
+    pub codex_anthropic_history:
+        Arc<RwLock<std::collections::HashMap<String, Vec<serde_json::Value>>>>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -72,6 +75,7 @@ impl ProxyServer {
             current_providers: Arc::new(RwLock::new(std::collections::HashMap::new())),
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
+            codex_anthropic_history: Arc::new(RwLock::new(std::collections::HashMap::new())),
             app_handle,
             failover_manager,
         };

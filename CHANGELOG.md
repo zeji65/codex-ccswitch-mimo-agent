@@ -5,6 +5,12 @@ All notable changes to CC Switch will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added an application documentation package for the Codex + CC Switch multi-model AI R&D Agent system, including architecture, Agent workflow, token planning, roadmap, and MiMo Token Plan application summary.
+
 ## [3.13.0] - 2026-04-10
 
 Development since v3.12.3 focuses on quota visibility, provider workflow upgrades, stronger proxy compatibility, and lower-overhead tray / session workflows.
@@ -50,6 +56,26 @@ Development since v3.12.3 focuses on quota visibility, provider workflow upgrade
 
 - **Codex OAuth Login-State UX & Recovery**: Reworded Codex OAuth expired states to focus on invalid sign-in rather than “session expired”, stopped background quota polling so inactive login states are not churned, and added a switch recovery flow that first retries by importing the current Codex desktop auth before automatically launching ChatGPT re-auth when recovery still fails. The auth manager now also persists each account’s native `auth.json` snapshot, switches managed Codex accounts directly from that snapshot, uses read-only tokens for quota checks, lets provider cards query their own bound account once without recurring polling, displays Codex OAuth quota as remaining percentage, adds per-account re-login UX so a broken account can be repaired without manually logging out the currently usable one, and stops account-pool switching from killing/relaunching Codex processes to avoid closing the host Codex Desktop app.
 - **Dev Restart Stability**: Prevented the settings restart command from calling Tauri's process restart path in debug builds, avoiding dev-mode闪退 when users click restart.
+- **Custom Build Update Isolation**: Disabled in-app update checks and updater artifact generation for custom builds so forked packages no longer point back to the upstream release channel or require updater signing keys during packaging.
+- **Custom Build Update UI Lockdown**: Hid the About-page updater actions for custom builds and short-circuited the update context before any startup auto-check runs, so forked desktop packages no longer present upstream release/update entry points in the UI.
+- **Codex OAuth Status Poll Quieting**: Stopped Codex OAuth status reads from auto-syncing the native `auth.json` snapshot and disabled window-focus/reconnect auto-refetches in the managed-auth hook, reducing background login-state churn while keeping explicit import/switch actions intact.
+- **Codex DeepSeek / MiMo Responses Bridge**: Added a lightweight Codex third-party bridge for anthropic-compatible providers so the new Codex provider presets can keep the Desktop app on the Responses workflow while the proxy rewrites `/v1/responses` into Anthropic `/v1/messages`, converts Anthropic JSON/SSE replies back into Responses payloads, and maps upstream cache-hit usage fields back into Codex accounting.
+- **Codex Third-Party Long-Session Guard**: Added DeepSeek and Xiaomi MiMo Codex presets with anthropic bridge metadata, persisted the Codex-side `apiFormat` selection in provider forms, raised the third-party auto-compact threshold to keep long sessions on the normal Responses path, and explicitly blocked unsupported `/responses/compact` calls on the anthropic bridge with a clear fallback message.
+- **Codex Anthropic-Bridge Auth Headers**: Fixed Codex third-party bridge providers to send Anthropic-style `x-api-key` authentication instead of OpenAI-style Bearer headers when `apiFormat=anthropic`, so DeepSeek and Xiaomi MiMo bridge requests reach `/v1/messages` with the expected upstream auth contract.
+- **Codex MiMo Bridge Runtime Path**: Installed Rustls' ring crypto provider at app startup to prevent HTTPS proxy requests from panicking, added an in-memory `previous_response_id` history cache for the Codex Responses → Anthropic bridge, and converted MiMo thinking SSE blocks into Responses reasoning events while preserving visible output text.
+- **Codex MiMo Role Compatibility**: Normalized Codex Responses `developer` and other non-Anthropic message roles to `user` before forwarding to MiMo `/v1/messages`, and wrote the Codex proxy URL with `localhost` to avoid local system proxy interference.
+- **Codex MiMo Model Pinning**: Forced Codex third-party Anthropic bridge requests to use the selected provider's configured upstream model so official Codex model names such as `gpt-5.3-codex` cannot leak to MiMo / DeepSeek.
+- **Codex DeepSeek Max Tokens**: Always send Anthropic `max_tokens` from Codex Responses bridge requests, mapping `max_output_tokens` when present and falling back to a safe default when Codex omits it.
+- **Codex DeepSeek Tool Schema Compatibility**: Normalized null or missing Responses tool schemas such as `apply_patch` to Anthropic-compatible object schemas before forwarding to DeepSeek / MiMo.
+- **Codex DeepSeek Tool Name Compatibility**: Skipped empty tool definitions and normalized tool names to OpenAI-compatible identifiers before forwarding to strict DeepSeek tool APIs.
+- **Codex Provider Switch Restart**: Restart Codex Desktop after Codex provider switches, including proxy hot-switches, so existing windows reload the current CC Switch routing instead of keeping stale runtime clients.
+- **Xiaomi MiMo Token Plan Endpoint**: Switched the Xiaomi MiMo Codex and Claude presets to the subscription-plan Anthropic endpoint at `https://token-plan-cn.xiaomimimo.com/anthropic`, while keeping the old API endpoint as a Codex candidate fallback.
+- **Codex LiteLLM Gateway Presets**: Added local LiteLLM Codex presets for DeepSeek, Xiaomi MiMo, Kimi, and Qwen, routing Codex Responses requests through the CC Switch proxy bridge to LiteLLM's OpenAI Chat Completions endpoint at `http://localhost:4000/v1`.
+- **Codex OpenAI Chat Bridge**: Added a lightweight Codex Responses ↔ OpenAI Chat bridge for LiteLLM-backed providers, including request conversion, `/v1/responses` to `/v1/chat/completions` routing, and basic Responses SSE reconstruction for streaming replies.
+- **Codex Restart Process Safety**: Narrowed Codex Desktop restart process matching so switching Codex providers no longer kills unrelated `codex app-server` processes such as VS Code/Codex extension hosts.
+- **Codex Provider Switch Without Forced Restart**: Changed Codex official provider updates and third-party→official provider switches to reuse the runtime-only auth/config apply path instead of the old kill-and-relaunch desktop path, so model/provider switching no longer re-enters Codex account restart orchestration just to restore the official provider.
+- **Codex Official Restore Switch Regression**: Restored the desktop restart path specifically for third-party→official Codex provider switches after confirming the no-restart variant prevented real-world switches back to the official account runtime. Current official-provider edits still use the lighter runtime-only apply path.
+- **Codex Provider Proxy Rebuild**: Reworked non-official Anthropic-format Codex providers to enter the local Responses proxy bridge instead of writing third-party upstreams directly into `config.toml`, preserving the original live restore backup while hot-switching DeepSeek / MiMo targets through `cc_switch_proxy`.
 - **Copilot Authentication & Proxy Compatibility**: Fixed GitHub Copilot authentication regressions, corrected enterprise / dynamic endpoint handling, repaired clipboard verification-code copying on macOS and Linux, and fixed Responses routing when Copilot-backed Claude providers target OpenAI models.
 - **Streaming Parser Compatibility**: Fixed SSE parsing to accept fields with optional spaces, improving compatibility with non-strict streaming implementations.
 - **UTF-8 Stream Chunk Boundaries**: Fixed intermittent garbled output (U+FFFD replacement characters) in Claude Code when multi-byte UTF-8 sequences such as Chinese characters or emoji were split across TCP stream chunks via the Copilot reverse proxy, by preserving incomplete trailing bytes across chunks in all four SSE streaming paths instead of lossy decoding.
@@ -74,6 +100,8 @@ Development since v3.12.3 focuses on quota visibility, provider workflow upgrade
 
 ### Docs
 
+- **LiteLLM CN Models Example**: Added `docs/examples/litellm-cn-models.yaml` as a local gateway template for DeepSeek, Xiaomi MiMo, Kimi, and Qwen without embedding user secrets.
+- **Provider Rebuild Handoff**: Added `HANDOFF_PROVIDER_REBUILD_2026-05-03.md` to capture the current Codex / MiMo / DeepSeek provider-routing dead end, verified local state, user expectations, and the recommended full re-architecture direction for the next implementation session.
 - **User Manual Refresh**: Updated the EN / ZH / JA manuals for tray submenus, lightweight mode, provider model fetching, session management, workspace files, WebDAV v2 behavior, OpenCode / OpenClaw activation, and other provider workflow improvements.
 - **Community & Contribution Docs**: Added `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, bilingual issue / PR templates, Dependabot config, and CI quality checks.
 - **Release Notes Risk Notice**: Added a Copilot reverse proxy risk notice and anchored highlight links in the v3.12.3 release notes across all three languages.

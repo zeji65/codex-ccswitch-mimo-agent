@@ -868,7 +868,7 @@ export const providerPresets: ProviderPreset[] = [
     apiKeyUrl: "https://platform.xiaomimimo.com/#/console/api-keys",
     settingsConfig: {
       env: {
-        ANTHROPIC_BASE_URL: "https://api.xiaomimimo.com/anthropic",
+        ANTHROPIC_BASE_URL: "https://token-plan-cn.xiaomimimo.com/anthropic",
         ANTHROPIC_AUTH_TOKEN: "",
         ANTHROPIC_MODEL: "mimo-v2-pro",
         ANTHROPIC_DEFAULT_HAIKU_MODEL: "mimo-v2-pro",

@@ -845,6 +845,7 @@ mod tests {
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
+            codex_anthropic_history: Arc::new(RwLock::new(HashMap::new())),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

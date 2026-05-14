@@ -172,10 +172,10 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
         let proxy_service = &app_state.proxy_service;
 
         // 1) 确保代理服务运行（会自动设置 proxy_enabled = true）
-        let is_running = futures::executor::block_on(proxy_service.is_running());
+        let is_running = tauri::async_runtime::block_on(proxy_service.is_running());
         if !is_running {
             log::info!("[Tray] Auto 模式：启动代理服务");
-            if let Err(e) = futures::executor::block_on(proxy_service.start()) {
+            if let Err(e) = tauri::async_runtime::block_on(proxy_service.start()) {
                 log::error!("[Tray] 启动代理服务失败: {e}");
                 return Err(AppError::Message(format!("启动代理服务失败: {e}")));
             }
@@ -184,7 +184,7 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
         // 2) 执行 Live 配置接管（确保该 app 被代理接管）
         log::info!("[Tray] Auto 模式：对 {app_type_str} 执行接管");
         if let Err(e) =
-            futures::executor::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
+            tauri::async_runtime::block_on(proxy_service.set_takeover_for_app(app_type_str, true))
         {
             log::error!("[Tray] 执行接管失败: {e}");
             return Err(AppError::Message(format!("执行接管失败: {e}")));
@@ -196,7 +196,7 @@ fn handle_auto_click(app: &tauri::AppHandle, app_type: &AppType) -> Result<(), A
             .set_proxy_flags_sync(app_type_str, true, true)?;
 
         // 3.1) 立即切到队列 P1（热切换：不写 Live，仅更新 DB/settings/备份）
-        if let Err(e) = futures::executor::block_on(
+        if let Err(e) = tauri::async_runtime::block_on(
             proxy_service.switch_proxy_target(app_type_str, &p1_provider_id),
         ) {
             log::error!("[Tray] Auto 模式切换到队列 P1 失败: {e}");
@@ -298,7 +298,7 @@ pub fn create_tray_menu(
     menu_builder = menu_builder.item(&show_main_item).separator();
 
     // Pre-compute proxy running state (used to disable official providers in tray menu)
-    let is_proxy_running = futures::executor::block_on(app_state.proxy_service.is_running());
+    let is_proxy_running = tauri::async_runtime::block_on(app_state.proxy_service.is_running());
 
     // 每个应用类型折叠为子菜单，避免供应商过多时菜单过长
     for section in TRAY_SECTIONS.iter() {
@@ -332,7 +332,7 @@ pub fn create_tray_menu(
 
             // Check if this app is under proxy takeover (for disabling official providers)
             let is_app_taken_over = is_proxy_running
-                && (futures::executor::block_on(app_state.db.get_live_backup(app_type_str))
+                && (tauri::async_runtime::block_on(app_state.db.get_live_backup(app_type_str))
                     .ok()
                     .flatten()
                     .is_some()

@@ -535,9 +535,20 @@ fn codex_backfill_auth_placeholder(provider: &Provider) -> Option<Value> {
 }
 
 fn build_codex_managed_auth(account_id: Option<&str>) -> Result<Value, AppError> {
-    let manager = CodexOAuthManager::new(crate::config::get_app_config_dir());
+    let auth_result = if tokio::runtime::Handle::try_current().is_ok() {
+        let account_id = account_id.map(ToOwned::to_owned);
+        std::thread::spawn(move || {
+            let manager = CodexOAuthManager::new(crate::config::get_app_config_dir());
+            tauri::async_runtime::block_on(manager.build_native_auth(account_id.as_deref()))
+        })
+        .join()
+        .map_err(|_| AppError::Message("Codex OAuth 凭据生成线程异常退出".to_string()))?
+    } else {
+        let manager = CodexOAuthManager::new(crate::config::get_app_config_dir());
+        tauri::async_runtime::block_on(manager.build_native_auth(account_id))
+    };
 
-    tauri::async_runtime::block_on(manager.build_native_auth(account_id)).map_err(|err| {
+    auth_result.map_err(|err| {
         let message = match err {
             CodexOAuthError::RefreshTokenInvalid => {
                 "CODEX_OAUTH_REAUTH_REQUIRED: 当前账号的登录态已失效，请重新登录 ChatGPT 账号"
@@ -933,50 +944,6 @@ pub(crate) fn sync_current_provider_for_app_to_live(
     }
 
     McpService::sync_all_enabled(state)?;
-
-    Ok(())
-}
-
-/// Sync current provider to live configuration
-///
-/// 使用有效的当前供应商 ID（验证过存在性）。
-/// 优先从本地 settings 读取，验证后 fallback 到数据库的 is_current 字段。
-/// 这确保了配置导入后无效 ID 会自动 fallback 到数据库。
-///
-/// For additive mode apps (OpenCode), all providers are synced instead of just the current one.
-pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
-    // Sync providers based on mode
-    for app_type in AppType::all() {
-        if app_type.is_additive_mode() {
-            // Additive mode: sync ALL providers
-            sync_all_providers_to_live(state, &app_type)?;
-        } else {
-            // Switch mode: sync only current provider
-            let current_id =
-                match crate::settings::get_effective_current_provider(&state.db, &app_type)? {
-                    Some(id) => id,
-                    None => continue,
-                };
-
-            let providers = state.db.get_all_providers(app_type.as_str())?;
-            if let Some(provider) = providers.get(&current_id) {
-                write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
-            }
-            // Note: get_effective_current_provider already validates existence,
-            // so providers.get() should always succeed here
-        }
-    }
-
-    // MCP sync
-    McpService::sync_all_enabled(state)?;
-
-    // Skill sync
-    for app_type in AppType::all() {
-        if let Err(e) = crate::services::skill::SkillService::sync_to_app(&state.db, &app_type) {
-            log::warn!("同步 Skill 到 {app_type:?} 失败: {e}");
-            // Continue syncing other apps, don't abort
-        }
-    }
 
     Ok(())
 }

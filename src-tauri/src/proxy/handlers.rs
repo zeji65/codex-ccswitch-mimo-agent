@@ -14,10 +14,15 @@ use super::{
     },
     handler_context::RequestContext,
     providers::{
-        get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
+        get_adapter, get_claude_api_format, get_codex_api_format,
+        streaming::create_anthropic_sse_stream,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
-        streaming_responses::create_anthropic_sse_stream_from_responses, transform,
-        transform_gemini, transform_responses,
+        streaming_responses::{
+            create_anthropic_sse_stream_from_responses,
+            create_responses_sse_stream_from_anthropic_with_history,
+            create_responses_sse_stream_from_openai_chat, AnthropicHistoryRecorder,
+        },
+        transform, transform_gemini, transform_responses,
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
@@ -402,7 +407,7 @@ pub async fn handle_responses(
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     let mut ctx =
@@ -414,12 +419,22 @@ pub async fn handle_responses(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    if get_codex_api_format(&ctx.provider) == "anthropic" {
+        body = attach_codex_anthropic_history(&state, &ctx, body).await;
+    }
+
+    let codex_anthropic_request_messages = if get_codex_api_format(&ctx.provider) == "anthropic" {
+        Some(transform_responses::extract_anthropic_messages_from_responses_request(&body)?)
+    } else {
+        None
+    };
+
     let forwarder = ctx.create_forwarder(&state);
     let result = match forwarder
         .forward_with_retry(
             &AppType::Codex,
             &endpoint,
-            body,
+            body.clone(),
             headers,
             extensions,
             ctx.get_providers(),
@@ -438,6 +453,26 @@ pub async fn handle_responses(
 
     ctx.provider = result.provider;
     let response = result.response;
+    let api_format = result
+        .claude_api_format
+        .as_deref()
+        .unwrap_or_else(|| get_codex_api_format(&ctx.provider))
+        .to_string();
+
+    if api_format == "anthropic" {
+        return handle_codex_anthropic_transform(
+            response,
+            &ctx,
+            &state,
+            codex_anthropic_request_messages.unwrap_or_default(),
+            is_stream,
+        )
+        .await;
+    }
+
+    if api_format == "openai_chat" {
+        return handle_codex_openai_chat_transform(response, &ctx, &state, is_stream).await;
+    }
 
     process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
 }
@@ -491,9 +526,385 @@ pub async fn handle_responses_compact(
     };
 
     ctx.provider = result.provider;
-    let response = result.response;
+    let api_format = result
+        .claude_api_format
+        .as_deref()
+        .unwrap_or_else(|| get_codex_api_format(&ctx.provider))
+        .to_string();
 
-    process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    if api_format == "anthropic" {
+        return Err(ProxyError::TransformError(
+            "当前第三方 Codex provider 暂不支持 Responses Compact，请先继续当前长会话或切回官方链路".to_string(),
+        ));
+    }
+
+    if api_format == "openai_chat" {
+        return Err(ProxyError::TransformError(
+            "当前 LiteLLM/OpenAI Chat Codex provider 暂不支持 Responses Compact，请先开新会话或切回官方链路".to_string(),
+        ));
+    }
+
+    process_response(result.response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+}
+
+fn codex_anthropic_history_key(provider_id: &str, response_id: &str) -> String {
+    format!("{provider_id}:{response_id}")
+}
+
+async fn attach_codex_anthropic_history(
+    state: &ProxyState,
+    ctx: &RequestContext,
+    mut body: Value,
+) -> Value {
+    let Some(previous_response_id) = body
+        .get("previous_response_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    else {
+        return body;
+    };
+
+    let key = codex_anthropic_history_key(&ctx.provider.id, previous_response_id);
+    let history = state
+        .codex_anthropic_history
+        .read()
+        .await
+        .get(&key)
+        .cloned();
+
+    match history {
+        Some(history) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    transform_responses::CODEX_ANTHROPIC_HISTORY_KEY.to_string(),
+                    json!(history),
+                );
+            }
+        }
+        None => {
+            log::warn!(
+                "[Codex/AnthropicBridge] previous_response_id 未命中本地缓存: provider={}, response_id={}",
+                ctx.provider.id,
+                previous_response_id
+            );
+        }
+    }
+
+    body
+}
+
+async fn remember_codex_anthropic_history(
+    state: &ProxyState,
+    provider_id: &str,
+    response_id: &str,
+    history: Vec<Value>,
+) {
+    if response_id.is_empty() || history.is_empty() {
+        return;
+    }
+
+    let mut store = state.codex_anthropic_history.write().await;
+    if store.len() > 512 {
+        store.clear();
+    }
+    store.insert(
+        codex_anthropic_history_key(provider_id, response_id),
+        history,
+    );
+}
+
+async fn remember_codex_anthropic_response(
+    state: &ProxyState,
+    provider_id: &str,
+    request_messages: Vec<Value>,
+    upstream_response: &Value,
+) {
+    let Some(response_id) = upstream_response.get("id").and_then(|value| value.as_str()) else {
+        return;
+    };
+    let Some(content) = upstream_response
+        .get("content")
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+    let history_content: Vec<Value> = content
+        .iter()
+        .filter(|block| block.get("type").and_then(|value| value.as_str()) != Some("thinking"))
+        .cloned()
+        .collect();
+    if history_content.is_empty() {
+        return;
+    }
+
+    let mut history = request_messages;
+    history.push(json!({
+        "role": "assistant",
+        "content": history_content
+    }));
+    remember_codex_anthropic_history(state, provider_id, response_id, history).await;
+}
+
+async fn handle_codex_anthropic_transform(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    request_messages: Vec<Value>,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+
+    if is_stream {
+        let stream = response.bytes_stream();
+        let history_recorder: AnthropicHistoryRecorder = {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            std::sync::Arc::new(move |response_id, history| {
+                let state = state.clone();
+                let provider_id = provider_id.clone();
+                tokio::spawn(async move {
+                    remember_codex_anthropic_history(&state, &provider_id, &response_id, history)
+                        .await;
+                });
+            })
+        };
+        let responses_stream = create_responses_sse_stream_from_anthropic_with_history(
+            stream,
+            request_messages.clone(),
+            Some(history_recorder),
+        );
+
+        let usage_collector = {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            let model = ctx.request_model.clone();
+            let status_code = status.as_u16();
+            let start_time = ctx.start_time;
+
+            SseUsageCollector::new(start_time, move |events, first_token_ms| {
+                if let Some(usage) = TokenUsage::from_codex_stream_events_auto(&events) {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let model = model.clone();
+
+                    tokio::spawn(async move {
+                        log_usage(
+                            &state,
+                            &provider_id,
+                            "codex",
+                            &model,
+                            &model,
+                            usage,
+                            latency_ms,
+                            first_token_ms,
+                            true,
+                            status_code,
+                        )
+                        .await;
+                    });
+                }
+            })
+        };
+
+        let timeout_config = ctx.streaming_timeout_config();
+        let logged_stream = create_logged_passthrough_stream(
+            responses_stream,
+            "Codex/AnthropicBridge",
+            Some(usage_collector),
+            timeout_config,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
+    }
+
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (mut response_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+    let upstream_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        ProxyError::TransformError(format!("Failed to parse anthropic response: {e}"))
+    })?;
+    remember_codex_anthropic_response(
+        state,
+        &ctx.provider.id,
+        request_messages,
+        &upstream_response,
+    )
+    .await;
+    let codex_response = transform_responses::anthropic_response_to_responses(upstream_response)?;
+
+    if let Some(usage) = TokenUsage::from_codex_response_auto(&codex_response) {
+        let latency_ms = ctx.latency_ms();
+        let request_model = ctx.request_model.clone();
+        let provider_id = ctx.provider.id.clone();
+        let model = codex_response
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&request_model)
+            .to_string();
+        let state = state.clone();
+        tokio::spawn(async move {
+            log_usage(
+                &state,
+                &provider_id,
+                "codex",
+                &model,
+                &request_model,
+                usage,
+                latency_ms,
+                None,
+                false,
+                status.as_u16(),
+            )
+            .await;
+        });
+    }
+
+    let mut builder = axum::response::Response::builder().status(status);
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header("content-type", "application/json");
+
+    let response_body = serde_json::to_vec(&codex_response).map_err(|e| {
+        ProxyError::TransformError(format!("Failed to serialize Codex response: {e}"))
+    })?;
+
+    builder
+        .body(axum::body::Body::from(response_body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {e}")))
+}
+
+async fn handle_codex_openai_chat_transform(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+
+    if is_stream {
+        let stream = response.bytes_stream();
+        let responses_stream = create_responses_sse_stream_from_openai_chat(stream);
+        let usage_collector = {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            let model = ctx.request_model.clone();
+            let status_code = status.as_u16();
+            let start_time = ctx.start_time;
+
+            SseUsageCollector::new(start_time, move |events, first_token_ms| {
+                if let Some(usage) = TokenUsage::from_codex_stream_events_auto(&events) {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let model = model.clone();
+
+                    tokio::spawn(async move {
+                        log_usage(
+                            &state,
+                            &provider_id,
+                            "codex",
+                            &model,
+                            &model,
+                            usage,
+                            latency_ms,
+                            first_token_ms,
+                            true,
+                            status_code,
+                        )
+                        .await;
+                    });
+                }
+            })
+        };
+
+        let timeout_config = ctx.streaming_timeout_config();
+        let logged_stream = create_logged_passthrough_stream(
+            responses_stream,
+            "Codex/OpenAIChatBridge",
+            Some(usage_collector),
+            timeout_config,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
+    }
+
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (mut response_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    let upstream_response: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::TransformError(format!("Failed to parse chat response: {e}")))?;
+    let codex_response = transform_responses::openai_chat_response_to_responses(upstream_response)?;
+
+    if let Some(usage) = TokenUsage::from_codex_response_auto(&codex_response) {
+        let latency_ms = ctx.latency_ms();
+        let request_model = ctx.request_model.clone();
+        let provider_id = ctx.provider.id.clone();
+        let model = codex_response
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&request_model)
+            .to_string();
+        log_usage(
+            state,
+            &provider_id,
+            "codex",
+            &request_model,
+            &model,
+            usage,
+            latency_ms,
+            None,
+            false,
+            200,
+        )
+        .await;
+    }
+
+    response_headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let body = axum::body::Body::from(
+        serde_json::to_vec(&codex_response)
+            .map_err(|e| ProxyError::Internal(format!("Failed to serialize response: {e}")))?,
+    );
+    Ok((response_headers, body).into_response())
 }
 
 // ============================================================================

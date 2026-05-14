@@ -147,12 +147,15 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         let openai_tools: Vec<Value> = tools
             .iter()
-            .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("BatchTool"))
-            .map(|t| {
+            .filter_map(|t| {
+                if t.get("type").and_then(|v| v.as_str()) == Some("BatchTool") {
+                    return None;
+                }
+                let name = normalize_function_name(t.get("name").and_then(|n| n.as_str()))?;
                 let mut tool = json!({
                     "type": "function",
                     "function": {
-                        "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                        "name": name,
                         "description": t.get("description"),
                         "parameters": clean_schema(t.get("input_schema").cloned().unwrap_or(json!({})))
                     }
@@ -160,7 +163,7 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
                 if let Some(cc) = t.get("cache_control") {
                     tool["cache_control"] = cc.clone();
                 }
-                tool
+                Some(tool)
             })
             .collect();
 
@@ -169,8 +172,11 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
         }
     }
 
-    if let Some(v) = body.get("tool_choice") {
-        result["tool_choice"] = v.clone();
+    if let Some(v) = body
+        .get("tool_choice")
+        .and_then(normalize_openai_tool_choice)
+    {
+        result["tool_choice"] = v;
     }
 
     Ok(result)
@@ -399,6 +405,54 @@ pub fn clean_schema(mut schema: Value) -> Value {
     schema
 }
 
+pub fn normalize_function_name(name: Option<&str>) -> Option<String> {
+    let name = name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(name.len().min(64));
+    for ch in name.chars() {
+        if normalized.len() >= 64 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            normalized.push(ch);
+        } else {
+            normalized.push('_');
+        }
+    }
+
+    let normalized = normalized.trim_matches('_');
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn normalize_openai_tool_choice(tool_choice: &Value) -> Option<Value> {
+    match tool_choice {
+        Value::Object(obj) => {
+            let mut normalized = tool_choice.clone();
+            let name = obj
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|name| name.as_str())
+                .and_then(|name| normalize_function_name(Some(name)));
+            if let Some(name) = name {
+                normalized["function"]["name"] = json!(name);
+                Some(normalized)
+            } else if obj.get("type").and_then(|value| value.as_str()) == Some("function") {
+                None
+            } else {
+                Some(normalized)
+            }
+        }
+        _ => Some(tool_choice.clone()),
+    }
+}
+
 /// OpenAI 响应 → Anthropic 响应
 pub fn openai_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     let choices = body
@@ -624,6 +678,33 @@ mod tests {
         let result = anthropic_to_openai(input).unwrap();
         assert_eq!(result["tools"][0]["type"], "function");
         assert_eq!(result["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_skips_empty_tool_names() {
+        let input = json!({
+            "model": "deepseek-v3.2",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Use tools"}],
+            "tools": [
+                {
+                    "name": "",
+                    "description": "Invalid empty tool",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "name": "valid/tool",
+                    "description": "Valid after normalization",
+                    "input_schema": {"type": "object"}
+                }
+            ]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+
+        let tools = result["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], json!("valid_tool"));
     }
 
     #[test]

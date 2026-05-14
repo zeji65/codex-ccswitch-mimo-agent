@@ -22,8 +22,13 @@ use crate::store::AppState;
 // Re-export sub-module functions for external access
 pub use live::{
     import_default_config, import_openclaw_providers_from_live,
-    import_opencode_providers_from_live, read_live_settings, sync_current_to_live,
+    import_opencode_providers_from_live, read_live_settings,
 };
+
+#[allow(dead_code)]
+pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
+    ProviderService::sync_current_to_live(state)
+}
 
 // Internal re-exports (pub(crate))
 pub(crate) use live::sanitize_claude_settings_for_live;
@@ -317,6 +322,152 @@ base_url = "http://localhost:8080"
         assert!(
             extracted.contains("http://localhost:8080"),
             "should keep mcp_servers.* base_url"
+        );
+    }
+
+    #[test]
+    fn codex_current_official_provider_update_prefers_runtime_only_apply() {
+        let official = Provider {
+            id: "official".to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        assert!(
+            ProviderService::should_apply_codex_provider_without_restart(&official),
+            "updating the current official Codex provider should stay on the runtime-only path"
+        );
+    }
+
+    #[test]
+    fn codex_third_party_provider_update_does_not_use_runtime_only_apply() {
+        let third_party = Provider {
+            id: "mimo".to_string(),
+            name: "Xiaomi MiMo".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("cn_official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        assert!(
+            !ProviderService::should_apply_codex_provider_without_restart(&third_party),
+            "non-official Codex providers should stay on the normal model-config update path"
+        );
+    }
+
+    #[test]
+    fn codex_official_provider_switch_requires_desktop_restart_path() {
+        let official = Provider {
+            id: "official".to_string(),
+            name: "OpenAI Official".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        assert!(
+            ProviderService::should_restart_codex_after_provider_switch(&official),
+            "switching back to the official Codex provider should keep using the desktop restart path"
+        );
+    }
+
+    #[test]
+    fn codex_third_party_provider_switch_requires_desktop_restart_path() {
+        let third_party = Provider {
+            id: "mimo".to_string(),
+            name: "Xiaomi MiMo".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("cn_official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        assert!(
+            ProviderService::should_restart_codex_after_provider_switch(&third_party),
+            "third-party Codex model switches should restart Codex Desktop so old windows reload runtime routing"
+        );
+    }
+
+    #[test]
+    fn codex_anthropic_provider_switch_uses_proxy_bridge() {
+        let mut third_party = Provider {
+            id: "mimo".to_string(),
+            name: "Xiaomi MiMo".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("cn_official".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        third_party.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("anthropic".to_string()),
+            ..Default::default()
+        });
+
+        assert!(
+            ProviderService::should_switch_codex_provider_via_proxy_bridge(&third_party),
+            "Anthropic-format Codex providers must be routed through the local Responses proxy"
+        );
+    }
+
+    #[test]
+    fn codex_responses_provider_switch_can_stay_on_direct_live_path() {
+        let mut third_party = Provider {
+            id: "router".to_string(),
+            name: "Responses Router".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: Some("aggregator".to_string()),
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        third_party.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_responses".to_string()),
+            ..Default::default()
+        });
+
+        assert!(
+            !ProviderService::should_switch_codex_provider_via_proxy_bridge(&third_party),
+            "Responses-compatible Codex providers can still use the direct live config path"
         );
     }
 
@@ -931,6 +1082,71 @@ base_url = "http://localhost:8080"
 }
 
 impl ProviderService {
+    fn should_apply_codex_provider_without_restart(provider: &Provider) -> bool {
+        provider.category.as_deref() == Some("official")
+    }
+
+    fn should_restart_codex_after_provider_switch(_provider: &Provider) -> bool {
+        true
+    }
+
+    fn should_switch_codex_provider_via_proxy_bridge(provider: &Provider) -> bool {
+        if provider.category.as_deref() == Some("official") {
+            return false;
+        }
+        matches!(
+            crate::proxy::providers::get_codex_api_format(provider),
+            "anthropic" | "openai_chat"
+        )
+    }
+
+    fn switch_codex_provider_via_proxy_bridge(
+        state: &AppState,
+        provider_id: &str,
+    ) -> Result<SwitchResult, AppError> {
+        tauri::async_runtime::block_on(async {
+            state
+                .proxy_service
+                .set_takeover_for_app(AppType::Codex.as_str(), true)
+                .await?;
+            state
+                .proxy_service
+                .switch_proxy_target(AppType::Codex.as_str(), provider_id)
+                .await?;
+            Ok::<(), String>(())
+        })
+        .map_err(|e| AppError::Message(format!("切换 Codex 代理供应商失败: {e}")))?;
+
+        crate::services::codex_desktop::restart_codex_app()?;
+        Ok(SwitchResult::default())
+    }
+
+    fn stop_codex_proxy_takeover_if_needed(state: &AppState) -> Result<(), AppError> {
+        let takeover_enabled =
+            tauri::async_runtime::block_on(state.db.get_proxy_config_for_app(AppType::Codex.as_str()))
+                .map(|config| config.enabled)
+                .unwrap_or(false);
+        let has_live_backup =
+            tauri::async_runtime::block_on(state.db.get_live_backup(AppType::Codex.as_str()))
+                .ok()
+                .flatten()
+                .is_some();
+        let live_taken_over = state
+            .proxy_service
+            .detect_takeover_in_live_config_for_app(&AppType::Codex);
+
+        if takeover_enabled || has_live_backup || live_taken_over {
+            tauri::async_runtime::block_on(
+                state
+                    .proxy_service
+                    .set_takeover_for_app(AppType::Codex.as_str(), false),
+            )
+            .map_err(|e| AppError::Message(format!("关闭 Codex 代理接管失败: {e}")))?;
+        }
+
+        Ok(())
+    }
+
     fn normalize_provider_if_claude(app_type: &AppType, provider: &mut Provider) {
         if matches!(app_type, AppType::Claude) {
             let mut v = provider.settings_config.clone();
@@ -1032,6 +1248,13 @@ impl ProviderService {
         let current = state.db.get_current_provider(app_type.as_str())?;
         if current.is_none() {
             // No current provider, set as current and sync
+            if matches!(app_type, AppType::Codex)
+                && Self::should_switch_codex_provider_via_proxy_bridge(&provider)
+            {
+                return Self::switch_codex_provider_via_proxy_bridge(state, &provider.id)
+                    .map(|_| true);
+            }
+
             state
                 .db
                 .set_current_provider(app_type.as_str(), &provider.id)?;
@@ -1195,7 +1418,7 @@ impl ProviderService {
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
         if matches!(app_type, AppType::Codex)
-            && provider.category.as_deref() == Some("official")
+            && Self::should_apply_codex_provider_without_restart(&provider)
             && is_current
         {
             let original_provider = existing_provider.as_ref().ok_or_else(|| {
@@ -1206,11 +1429,13 @@ impl ProviderService {
                 ))
             })?;
 
-            crate::services::codex_desktop::switch_desktop_to_provider(
-                state,
-                &provider,
-                Some(original_provider),
-                false,
+            tauri::async_runtime::block_on(
+                crate::services::codex_desktop::switch_desktop_to_provider_with_runtime_auth_sync(
+                    state,
+                    &provider,
+                    Some(original_provider),
+                    false,
+                ),
             )?;
             return Ok(true);
         }
@@ -1219,22 +1444,29 @@ impl ProviderService {
         state.db.save_provider(app_type.as_str(), &provider)?;
 
         if is_current {
+            if matches!(app_type, AppType::Codex)
+                && Self::should_switch_codex_provider_via_proxy_bridge(&provider)
+            {
+                return Self::switch_codex_provider_via_proxy_bridge(state, &provider.id)
+                    .map(|_| true);
+            }
+
             // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
             // - 不直接走普通 Live 写入逻辑
             // - 改为更新 Live 备份，并在 Claude 下同步代理安全的 Live 配置
             let has_live_backup =
-                futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
+                tauri::async_runtime::block_on(state.db.get_live_backup(app_type.as_str()))
                     .ok()
                     .flatten()
                     .is_some();
-            let is_proxy_running = futures::executor::block_on(state.proxy_service.is_running());
+            let is_proxy_running = tauri::async_runtime::block_on(state.proxy_service.is_running());
             let live_taken_over = state
                 .proxy_service
                 .detect_takeover_in_live_config_for_app(&app_type);
             let should_sync_via_proxy = is_proxy_running && (has_live_backup || live_taken_over);
 
             if should_sync_via_proxy {
-                futures::executor::block_on(
+                tauri::async_runtime::block_on(
                     state
                         .proxy_service
                         .update_live_backup_from_provider(app_type.as_str(), &provider),
@@ -1242,7 +1474,7 @@ impl ProviderService {
                 .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
 
                 if matches!(app_type, AppType::Claude) {
-                    futures::executor::block_on(
+                    tauri::async_runtime::block_on(
                         state
                             .proxy_service
                             .sync_claude_live_from_provider_while_proxy_active(&provider),
@@ -1413,15 +1645,21 @@ impl ProviderService {
             return Self::switch_normal(state, app_type, id, &providers);
         }
 
+        if matches!(app_type, AppType::Codex)
+            && Self::should_switch_codex_provider_via_proxy_bridge(_provider)
+        {
+            return Self::switch_codex_provider_via_proxy_bridge(state, id);
+        }
+
         // Check if proxy takeover mode is active AND proxy server is actually running
         // Both conditions must be true to use hot-switch mode
         // Use blocking wait since this is a sync function
         let is_app_taken_over =
-            futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
+            tauri::async_runtime::block_on(state.db.get_live_backup(app_type.as_str()))
                 .ok()
                 .flatten()
                 .is_some();
-        let is_proxy_running = futures::executor::block_on(state.proxy_service.is_running());
+        let is_proxy_running = tauri::async_runtime::block_on(state.proxy_service.is_running());
         let live_taken_over = state
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
@@ -1432,6 +1670,11 @@ impl ProviderService {
         // Block switching to official providers when proxy takeover is active.
         // Using a proxy with official APIs (Anthropic/OpenAI/Google) may cause account bans.
         if should_hot_switch && _provider.category.as_deref() == Some("official") {
+            if matches!(app_type, AppType::Codex) {
+                Self::stop_codex_proxy_takeover_if_needed(state)?;
+                return Self::switch_normal(state, app_type, id, &providers);
+            }
+
             return Err(AppError::localized(
                 "switch.official_blocked_by_proxy",
                 "代理接管模式下不能切换到官方供应商，使用代理访问官方 API 可能导致账号被封禁。请先关闭代理接管，或选择第三方供应商。",
@@ -1447,12 +1690,16 @@ impl ProviderService {
                 id
             );
 
-            futures::executor::block_on(
+            tauri::async_runtime::block_on(
                 state
                     .proxy_service
                     .hot_switch_provider(app_type.as_str(), id),
             )
             .map_err(|e| AppError::Message(format!("热切换失败: {e}")))?;
+
+            if matches!(app_type, AppType::Codex) {
+                crate::services::codex_desktop::restart_codex_app()?;
+            }
 
             // Note: No Live config write, no MCP sync
             // The proxy server will route requests to the new provider via is_current
@@ -1474,11 +1721,17 @@ impl ProviderService {
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
 
-        if matches!(app_type, AppType::Codex) && provider.category.as_deref() == Some("official") {
-            crate::services::codex_desktop::switch_desktop_to_provider(
-                state, provider, None, true,
-            )?;
-            return Ok(SwitchResult::default());
+        if matches!(app_type, AppType::Codex)
+            && Self::should_switch_codex_provider_via_proxy_bridge(provider)
+        {
+            return Self::switch_codex_provider_via_proxy_bridge(state, id);
+        }
+
+        let restart_codex_after_switch = matches!(app_type, AppType::Codex)
+            && Self::should_restart_codex_after_provider_switch(provider);
+
+        if restart_codex_after_switch {
+            Self::stop_codex_proxy_takeover_if_needed(state)?;
         }
 
         // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
@@ -1584,12 +1837,29 @@ impl ProviderService {
         // Sync MCP
         McpService::sync_all_enabled(state)?;
 
+        if restart_codex_after_switch {
+            crate::services::codex_desktop::restart_codex_app()?;
+        }
+
         Ok(result)
     }
 
     /// Sync current provider to live configuration (re-export)
     pub fn sync_current_to_live(state: &AppState) -> Result<(), AppError> {
-        sync_current_to_live(state)
+        for app_type in AppType::all() {
+            Self::sync_current_provider_for_app(state, app_type)?;
+        }
+
+        McpService::sync_all_enabled(state)?;
+
+        for app_type in AppType::all() {
+            if let Err(e) = crate::services::skill::SkillService::sync_to_app(&state.db, &app_type)
+            {
+                log::warn!("同步 Skill 到 {app_type:?} 失败: {e}");
+            }
+        }
+
+        Ok(())
     }
 
     pub fn sync_current_provider_for_app(
@@ -1612,12 +1882,12 @@ impl ProviderService {
         };
 
         let takeover_enabled =
-            futures::executor::block_on(state.db.get_proxy_config_for_app(app_type.as_str()))
+            tauri::async_runtime::block_on(state.db.get_proxy_config_for_app(app_type.as_str()))
                 .map(|config| config.enabled)
                 .unwrap_or(false);
 
         let has_live_backup =
-            futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
+            tauri::async_runtime::block_on(state.db.get_live_backup(app_type.as_str()))
                 .ok()
                 .flatten()
                 .is_some();
@@ -1627,12 +1897,31 @@ impl ProviderService {
             .detect_takeover_in_live_config_for_app(&app_type);
 
         if takeover_enabled && (has_live_backup || live_taken_over) {
-            futures::executor::block_on(
+            if matches!(app_type, AppType::Codex)
+                && Self::should_switch_codex_provider_via_proxy_bridge(provider)
+            {
+                tauri::async_runtime::block_on(
+                    state
+                        .proxy_service
+                        .sync_codex_live_from_provider_while_proxy_active(provider),
+                )
+                .map_err(|e| AppError::Message(format!("同步 Codex 代理 Live 配置失败: {e}")))?;
+                return Ok(());
+            }
+
+            tauri::async_runtime::block_on(
                 state
                     .proxy_service
                     .update_live_backup_from_provider(app_type.as_str(), provider),
             )
             .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+            return Ok(());
+        }
+
+        if matches!(app_type, AppType::Codex)
+            && Self::should_switch_codex_provider_via_proxy_bridge(provider)
+        {
+            Self::switch_codex_provider_via_proxy_bridge(state, &provider.id)?;
             return Ok(());
         }
 

@@ -17,7 +17,7 @@ use crate::proxy::providers::copilot_auth;
 use crate::proxy::providers::transform::anthropic_to_openai;
 use crate::proxy::providers::transform_gemini::anthropic_to_gemini;
 use crate::proxy::providers::transform_responses::anthropic_to_responses;
-use crate::proxy::providers::{get_adapter, AuthInfo, AuthStrategy};
+use crate::proxy::providers::{get_adapter, get_codex_api_format, AuthInfo, AuthStrategy};
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,16 +247,31 @@ impl StreamCheckService {
                 .await
             }
             AppType::Codex => {
-                Self::check_codex_stream(
-                    &client,
-                    &base_url,
-                    &auth,
-                    &model_to_test,
-                    test_prompt,
-                    request_timeout,
-                    provider,
-                )
-                .await
+                if get_codex_api_format(provider) == "anthropic" {
+                    Self::check_claude_stream(
+                        &client,
+                        &base_url,
+                        &auth,
+                        &model_to_test,
+                        test_prompt,
+                        request_timeout,
+                        provider,
+                        Some("anthropic"),
+                        None,
+                    )
+                    .await
+                } else {
+                    Self::check_codex_stream(
+                        &client,
+                        &base_url,
+                        &auth,
+                        &model_to_test,
+                        test_prompt,
+                        request_timeout,
+                        provider,
+                    )
+                    .await
+                }
             }
             AppType::Gemini => {
                 Self::check_gemini_stream(
