@@ -61,6 +61,7 @@ import { BasicFormFields } from "./BasicFormFields";
 import { ClaudeFormFields } from "./ClaudeFormFields";
 import { ClaudeDesktopProviderForm } from "./ClaudeDesktopProviderForm";
 import { CodexFormFields } from "./CodexFormFields";
+import { CodexOAuthSection } from "./CodexOAuthSection";
 import { GeminiFormFields } from "./GeminiFormFields";
 import { OmoFormFields } from "./OmoFormFields";
 import { parseOmoOtherFieldsObject } from "@/types/omo";
@@ -905,7 +906,8 @@ function ProviderFormFull({
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
-      initialData?.meta?.providerType === "codex_oauth";
+      initialData?.meta?.providerType === "codex_oauth" ||
+      (appId === "codex" && category === "official");
     if (isCopilotProvider && !isCopilotAuthenticated) {
       toast.error(
         t("copilot.loginRequired", {
@@ -1023,7 +1025,8 @@ function ProviderFormFull({
       baseUrl.includes("githubcopilot.com");
     const isCodexOauthProvider =
       templatePreset?.providerType === "codex_oauth" ||
-      initialData?.meta?.providerType === "codex_oauth";
+      initialData?.meta?.providerType === "codex_oauth" ||
+      (appId === "codex" && category === "official");
 
     let settingsConfig: string;
 
@@ -1165,7 +1168,9 @@ function ProviderFormFull({
 
     // 确定 providerType（新建时从预设获取，编辑时从现有数据获取）
     const providerType =
-      templatePreset?.providerType || initialData?.meta?.providerType;
+      templatePreset?.providerType ||
+      initialData?.meta?.providerType ||
+      (appId === "codex" && category === "official" ? "codex_oauth" : undefined);
 
     const nextMeta: ProviderMeta = {
       ...(baseMeta ?? {}),
@@ -1829,32 +1834,44 @@ function ProviderFormFull({
           )}
 
           {appId === "codex" && (
-            <CodexFormFields
-              providerId={providerId}
-              codexApiKey={codexApiKey}
-              onApiKeyChange={handleCodexApiKeyChange}
-              category={category}
-              shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
-              websiteUrl={codexWebsiteUrl}
-              isPartner={isCodexPartner}
-              partnerPromotionKey={codexPartnerPromotionKey}
-              shouldShowSpeedTest={shouldShowSpeedTest}
-              codexBaseUrl={codexBaseUrl}
-              onBaseUrlChange={handleCodexBaseUrlChange}
-              isFullUrl={localIsFullUrl}
-              onFullUrlChange={setLocalIsFullUrl}
-              isEndpointModalOpen={isCodexEndpointModalOpen}
-              onEndpointModalToggle={setIsCodexEndpointModalOpen}
-              onCustomEndpointsChange={
-                isEditMode ? undefined : setDraftCustomEndpoints
-              }
-              autoSelect={endpointAutoSelect}
-              onAutoSelectChange={setEndpointAutoSelect}
-              shouldShowModelField={category !== "official"}
-              modelName={codexModelName}
-              onModelNameChange={handleCodexModelNameChange}
-              speedTestEndpoints={speedTestEndpoints}
-            />
+            <>
+              {/* Codex OAuth 认证 (官方 ChatGPT Plus/Pro 账号) */}
+              {category === "official" && (
+                <CodexOAuthSection
+                  selectedAccountId={selectedCodexAccountId}
+                  onAccountSelect={setSelectedCodexAccountId}
+                  fastModeEnabled={codexFastMode}
+                  onFastModeChange={setCodexFastMode}
+                />
+              )}
+
+              <CodexFormFields
+                providerId={providerId}
+                codexApiKey={codexApiKey}
+                onApiKeyChange={handleCodexApiKeyChange}
+                category={category}
+                shouldShowApiKeyLink={shouldShowCodexApiKeyLink}
+                websiteUrl={codexWebsiteUrl}
+                isPartner={isCodexPartner}
+                partnerPromotionKey={codexPartnerPromotionKey}
+                shouldShowSpeedTest={shouldShowSpeedTest}
+                codexBaseUrl={codexBaseUrl}
+                onBaseUrlChange={handleCodexBaseUrlChange}
+                isFullUrl={localIsFullUrl}
+                onFullUrlChange={setLocalIsFullUrl}
+                isEndpointModalOpen={isCodexEndpointModalOpen}
+                onEndpointModalToggle={setIsCodexEndpointModalOpen}
+                onCustomEndpointsChange={
+                  isEditMode ? undefined : setDraftCustomEndpoints
+                }
+                autoSelect={endpointAutoSelect}
+                onAutoSelectChange={setEndpointAutoSelect}
+                shouldShowModelField={category !== "official"}
+                modelName={codexModelName}
+                onModelNameChange={handleCodexModelNameChange}
+                speedTestEndpoints={speedTestEndpoints}
+              />
+            </>
           )}
 
           {appId === "gemini" && (

@@ -478,6 +478,13 @@ async fn query_provider_usage_inner(
     }
 
     // ── 通用 JS 脚本路径 ──
+    // If no usage_script is configured and no special template_type matched,
+    // return "unsupported" instead of an error. This is NOT a failure — the provider
+    // simply doesn't support quota queries (common for third-party relay stations).
+    if usage_script.is_none() {
+        return Ok(crate::provider::UsageResult::not_supported());
+    }
+
     ProviderService::query_usage(state, app_type, provider_id)
         .await
         .map_err(|e| e.to_string())

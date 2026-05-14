@@ -16,6 +16,8 @@ export interface ManagedAuthStatus {
   provider: ManagedAuthProvider;
   authenticated: boolean;
   default_account_id: string | null;
+  current_account_id: string | null;
+  current_account_login: string | null;
   migration_error?: string | null;
   accounts: ManagedAuthAccount[];
 }
@@ -87,6 +89,24 @@ export async function authSetDefaultAccount(
   });
 }
 
+export async function authImportCurrent(
+  authProvider: ManagedAuthProvider,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_import_current", {
+    authProvider,
+  });
+}
+
+export async function authSwitchCurrentAccount(
+  authProvider: ManagedAuthProvider,
+  accountId?: string | null,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_switch_current_account", {
+    authProvider,
+    accountId: accountId || null,
+  });
+}
+
 export async function authLogout(
   authProvider: ManagedAuthProvider,
 ): Promise<void> {
@@ -102,5 +122,7 @@ export const authApi = {
   authGetStatus,
   authRemoveAccount,
   authSetDefaultAccount,
+  authImportCurrent,
+  authSwitchCurrentAccount,
   authLogout,
 };

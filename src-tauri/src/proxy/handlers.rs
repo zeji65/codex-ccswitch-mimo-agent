@@ -21,7 +21,8 @@ use super::{
         transform_gemini, transform_responses,
     },
     response_processor::{
-        create_logged_passthrough_stream, process_response, read_decoded_body,
+        create_logged_passthrough_stream, process_response,
+        process_response_with_codex_tail_repair, read_decoded_body,
         strip_entity_headers_for_rebuilt_body, strip_hop_by_hop_response_headers,
         usage_logging_enabled, SseUsageCollector,
     },
@@ -552,7 +553,7 @@ pub async fn handle_responses(
     ctx.provider = result.provider;
     let response = result.response;
 
-    process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    process_response_with_codex_tail_repair(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
@@ -606,7 +607,7 @@ pub async fn handle_responses_compact(
     ctx.provider = result.provider;
     let response = result.response;
 
-    process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    process_response_with_codex_tail_repair(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
 }
 
 // ============================================================================

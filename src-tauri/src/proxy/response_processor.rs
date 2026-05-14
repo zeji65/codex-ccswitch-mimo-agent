@@ -182,6 +182,16 @@ pub async fn handle_streaming(
     state: &ProxyState,
     parser_config: &UsageParserConfig,
 ) -> Response {
+    handle_streaming_inner(response, ctx, state, parser_config, false).await
+}
+
+async fn handle_streaming_inner(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    parser_config: &UsageParserConfig,
+    repair_codex_responses_tail: bool,
+) -> Response {
     let status = response.status();
     log::debug!(
         "[{}] 已接收上游流式响应: status={}, headers={}",
@@ -217,11 +227,25 @@ pub async fn handle_streaming(
     // 获取流式超时配置
     let timeout_config = ctx.streaming_timeout_config();
 
-    // 创建带日志和超时的透传流
-    let logged_stream =
-        create_logged_passthrough_stream(stream, ctx.tag, usage_collector, timeout_config);
+    // 创建带日志和超时的透传流。Codex Responses 透传可选启用极薄补尾：
+    // 只在上游正常 EOF 但缺 response.completed 时追加完成事件。
+    let body = if repair_codex_responses_tail {
+        axum::body::Body::from_stream(create_logged_passthrough_stream_with_codex_tail_repair(
+            stream,
+            ctx.tag,
+            usage_collector,
+            timeout_config,
+            ctx.request_model.clone(),
+        ))
+    } else {
+        axum::body::Body::from_stream(create_logged_passthrough_stream(
+            stream,
+            ctx.tag,
+            usage_collector,
+            timeout_config,
+        ))
+    };
 
-    let body = axum::body::Body::from_stream(logged_stream);
     match builder.body(body) {
         Ok(resp) => resp,
         Err(e) => {
@@ -342,6 +366,24 @@ pub async fn process_response(
 ) -> Result<Response, ProxyError> {
     if is_sse_response(&response) {
         Ok(handle_streaming(response, ctx, state, parser_config).await)
+    } else {
+        handle_non_streaming(response, ctx, state, parser_config).await
+    }
+}
+
+/// Codex Responses 透传响应处理。
+///
+/// 某些中转站能接 `/v1/responses`，但流式响应正常 EOF 前不会发送
+/// `response.completed`。Codex Desktop 会把这种响应判定为断流。这里仅对
+/// Codex Responses 路径启用补尾，不做协议转换、不吞上游错误。
+pub async fn process_response_with_codex_tail_repair(
+    response: ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    parser_config: &UsageParserConfig,
+) -> Result<Response, ProxyError> {
+    if is_sse_response(&response) {
+        Ok(handle_streaming_inner(response, ctx, state, parser_config, true).await)
     } else {
         handle_non_streaming(response, ctx, state, parser_config).await
     }
@@ -744,6 +786,239 @@ pub fn create_logged_passthrough_stream(
     }
 }
 
+/// 创建 Codex Responses 透传流，并在“正常 EOF 但缺 response.completed”时补尾。
+///
+/// 这是刻意很窄的兼容层：不转换协议、不修改工具事件、不吞掉 stream error。
+/// 若上游已经发送 `data: [DONE]` 但没发送 completed，会先暂存 `[DONE]`，
+/// 等补齐 `response.completed` 后再发回，避免客户端过早结束。
+pub fn create_logged_passthrough_stream_with_codex_tail_repair(
+    stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    tag: &'static str,
+    usage_collector: Option<SseUsageCollector>,
+    timeout_config: StreamingTimeoutConfig,
+    request_model: String,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    async_stream::stream! {
+        let mut buffer = String::new();
+        let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut collector = usage_collector;
+        let mut is_first_chunk = true;
+        let mut completed_seen = false;
+        let mut failed_seen = false;
+        let mut stream_error_seen = false;
+        let mut delayed_done_block: Option<String> = None;
+        let mut response_seed: Option<Value> = None;
+
+        let first_byte_timeout = if timeout_config.first_byte_timeout > 0 {
+            Some(Duration::from_secs(timeout_config.first_byte_timeout))
+        } else {
+            None
+        };
+        let idle_timeout = if timeout_config.idle_timeout > 0 {
+            Some(Duration::from_secs(timeout_config.idle_timeout))
+        } else {
+            None
+        };
+
+        tokio::pin!(stream);
+
+        loop {
+            let timeout_duration = if is_first_chunk {
+                first_byte_timeout
+            } else {
+                idle_timeout
+            };
+
+            let chunk_result = match timeout_duration {
+                Some(duration) => {
+                    match tokio::time::timeout(duration, stream.next()).await {
+                        Ok(Some(chunk)) => Some(chunk),
+                        Ok(None) => None,
+                        Err(_) => {
+                            let timeout_type = if is_first_chunk { "首字节" } else { "静默期" };
+                            log::error!("[{tag}] 流式响应{}超时 ({}秒)", timeout_type, duration.as_secs());
+                            stream_error_seen = true;
+                            yield Err(std::io::Error::other(format!("流式响应{timeout_type}超时")));
+                            break;
+                        }
+                    }
+                }
+                None => stream.next().await,
+            };
+
+            match chunk_result {
+                Some(Ok(bytes)) => {
+                    if is_first_chunk {
+                        log::debug!(
+                            "[{tag}] 已接收上游流式首包: bytes={}",
+                            bytes.len()
+                        );
+                    }
+                    is_first_chunk = false;
+                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+
+                    while let Some(event_text) = take_sse_block(&mut buffer) {
+                        if event_text.trim().is_empty() {
+                            continue;
+                        }
+
+                        let analysis = inspect_codex_responses_sse_event(
+                            &event_text,
+                            &mut collector,
+                            tag,
+                        ).await;
+
+                        completed_seen |= analysis.completed;
+                        failed_seen |= analysis.failed;
+                        if response_seed.is_none() {
+                            response_seed = analysis.response_seed;
+                        }
+
+                        if analysis.done && !completed_seen {
+                            delayed_done_block = Some(event_text);
+                            continue;
+                        }
+
+                        yield Ok(Bytes::from(format!("{event_text}\n\n")));
+                    }
+                }
+                Some(Err(e)) => {
+                    log::error!("[{tag}] 流错误: {e}");
+                    stream_error_seen = true;
+                    yield Err(std::io::Error::other(e.to_string()));
+                    break;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        if !stream_error_seen {
+            if !utf8_remainder.is_empty() {
+                buffer.push_str(&String::from_utf8_lossy(&utf8_remainder));
+                utf8_remainder.clear();
+            }
+
+            if !buffer.trim().is_empty() {
+                // 未完整分隔的尾部事件原样吐出；这种情况下不补尾，避免把截断流伪装成功。
+                log::warn!("[{tag}] Codex Responses SSE 流结束时存在未完成事件块，跳过补尾");
+                yield Ok(Bytes::from(buffer));
+            } else if !completed_seen && !failed_seen {
+                let repaired =
+                    synthesize_codex_response_completed_event(response_seed, &request_model);
+                log::warn!("[{tag}] Codex Responses SSE 缺少 response.completed，已补齐尾事件");
+                yield Ok(repaired);
+            }
+
+            if let Some(done_block) = delayed_done_block {
+                yield Ok(Bytes::from(format!("{done_block}\n\n")));
+            }
+        }
+
+        if let Some(c) = collector.take() {
+            c.finish().await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct CodexResponsesSseEventAnalysis {
+    completed: bool,
+    failed: bool,
+    done: bool,
+    response_seed: Option<Value>,
+}
+
+async fn inspect_codex_responses_sse_event(
+    event_text: &str,
+    collector: &mut Option<SseUsageCollector>,
+    tag: &'static str,
+) -> CodexResponsesSseEventAnalysis {
+    let mut analysis = CodexResponsesSseEventAnalysis::default();
+    let mut event_name = "";
+    let mut data_lines = Vec::new();
+
+    for line in event_text.lines() {
+        if let Some(event) = strip_sse_field(line, "event") {
+            event_name = event.trim();
+        } else if let Some(data) = strip_sse_field(line, "data") {
+            data_lines.push(data);
+        }
+    }
+
+    analysis.completed = event_name == "response.completed";
+    analysis.failed = matches!(event_name, "response.failed" | "error");
+
+    if data_lines.is_empty() {
+        return analysis;
+    }
+
+    let data = data_lines.join("\n");
+    if data.trim() == "[DONE]" {
+        log::debug!("[{tag}] <<< SSE: [DONE]");
+        analysis.done = true;
+        return analysis;
+    }
+
+    let parsed = serde_json::from_str::<Value>(&data).ok();
+    if let Some(json_value) = parsed.as_ref() {
+        if json_value.get("type").and_then(Value::as_str) == Some("response.created") {
+            analysis.response_seed = json_value.get("response").cloned();
+        }
+        if json_value.get("type").and_then(Value::as_str) == Some("response.completed") {
+            analysis.completed = true;
+        }
+        if json_value.get("type").and_then(Value::as_str) == Some("response.failed") {
+            analysis.failed = true;
+        }
+    }
+
+    let collected = match (collector.as_ref(), parsed) {
+        (Some(c), Some(json_value)) if c.should_collect(&data) => {
+            c.push(json_value).await;
+            true
+        }
+        _ => false,
+    };
+
+    if collected {
+        log::debug!("[{tag}] <<< SSE 事件: {data}");
+    } else {
+        log::debug!("[{tag}] <<< SSE 数据: {data}");
+    }
+
+    analysis
+}
+
+fn synthesize_codex_response_completed_event(
+    response_seed: Option<Value>,
+    request_model: &str,
+) -> Bytes {
+    let mut response = response_seed.unwrap_or_else(|| serde_json::json!({}));
+    if !response.is_object() {
+        response = serde_json::json!({});
+    }
+
+    let obj = response
+        .as_object_mut()
+        .expect("response should be normalized to an object");
+    obj.entry("id".to_string())
+        .or_insert_with(|| Value::String("resp_ccswitch_repaired".to_string()));
+    obj.entry("status".to_string())
+        .or_insert_with(|| Value::String("completed".to_string()));
+    obj.entry("model".to_string())
+        .or_insert_with(|| Value::String(request_model.to_string()));
+    obj.entry("output".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+
+    let event = serde_json::json!({
+        "type": "response.completed",
+        "response": response,
+    });
+    Bytes::from(format!("event: response.completed\ndata: {event}\n\n"))
+}
+
 fn format_headers(headers: &HeaderMap) -> String {
     headers
         .iter()
@@ -834,6 +1109,74 @@ mod tests {
             headers.get(axum::http::header::CONTENT_LENGTH),
             Some(&axum::http::HeaderValue::from_static("12"))
         );
+    }
+
+    #[tokio::test]
+    async fn codex_tail_repair_adds_completed_before_delayed_done() {
+        let chunks = vec![
+            Ok(Bytes::from_static(
+                b"event: response.created\n\
+data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\"}}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: response.output_text.delta\n\
+data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let mut stream = Box::pin(create_logged_passthrough_stream_with_codex_tail_repair(
+            futures::stream::iter(chunks),
+            "Codex",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            "gpt-5.4".to_string(),
+        ));
+
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+
+        let text = String::from_utf8(output).expect("utf8");
+        let completed_pos = text
+            .find("event: response.completed")
+            .expect("completed event");
+        let done_pos = text.find("data: [DONE]").expect("done event");
+        assert!(completed_pos < done_pos);
+        assert!(text.contains("\"id\":\"resp_1\""));
+        assert!(text.contains("\"status\":\"completed\""));
+    }
+
+    #[tokio::test]
+    async fn codex_tail_repair_does_not_duplicate_completed() {
+        let chunks = vec![Ok(Bytes::from_static(
+            b"event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\"}}\n\n",
+        ))];
+
+        let mut stream = Box::pin(create_logged_passthrough_stream_with_codex_tail_repair(
+            futures::stream::iter(chunks),
+            "Codex",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            "gpt-5.4".to_string(),
+        ));
+
+        let mut output = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.expect("stream chunk"));
+        }
+
+        let text = String::from_utf8(output).expect("utf8");
+        assert_eq!(text.matches("event: response.completed").count(), 1);
+        assert!(text.contains("resp_done"));
     }
 
     #[test]

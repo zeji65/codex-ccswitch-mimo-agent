@@ -165,6 +165,24 @@ pub struct UsageResult {
     pub error: Option<String>,
 }
 
+impl UsageResult {
+    /// Create a result indicating the provider does not support usage queries.
+    /// Represented as success=true with no data and a special error marker.
+    /// This is NOT a failure — the provider is still fully functional for switching.
+    pub fn not_supported() -> Self {
+        Self {
+            success: true,
+            data: None,
+            error: Some("unsupported".to_string()),
+        }
+    }
+
+    /// Check if this result indicates the provider doesn't support usage queries.
+    pub fn is_unsupported(&self) -> bool {
+        self.success && self.data.is_none() && self.error.as_deref() == Some("unsupported")
+    }
+}
+
 /// 供应商单独的模型测试配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderTestConfig {

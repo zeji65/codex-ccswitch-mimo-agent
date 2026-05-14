@@ -262,6 +262,69 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn switch_codex_provider_writes_live_config_and_current_markers() {
+        with_test_home(|state, home| {
+            let provider_a = Provider::with_id(
+                "codex-a".to_string(),
+                "Codex A".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "test-key-a" },
+                    "config": "model_provider = \"a\"\nmodel = \"gpt-5.4\"\n[model_providers.a]\nname = \"a\"\nbase_url = \"https://a.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+            let provider_b = Provider::with_id(
+                "codex-b".to_string(),
+                "Codex B".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "test-key-b" },
+                    "config": "model_provider = \"b\"\nmodel = \"gpt-5.4\"\n[model_providers.b]\nname = \"b\"\nbase_url = \"https://b.example/v1\"\nwire_api = \"responses\"\n"
+                }),
+                None,
+            );
+
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider_a)
+                .expect("save provider a");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider_b)
+                .expect("save provider b");
+            state
+                .db
+                .set_current_provider(AppType::Codex.as_str(), "codex-a")
+                .expect("set db current");
+            crate::settings::set_current_provider(&AppType::Codex, Some("codex-a"))
+                .expect("set local current");
+
+            ProviderService::switch(state, AppType::Codex, "codex-b")
+                .expect("switch codex provider");
+
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some("codex-b")
+            );
+            assert_eq!(
+                state
+                    .db
+                    .get_current_provider(AppType::Codex.as_str())
+                    .expect("db current")
+                    .as_deref(),
+                Some("codex-b")
+            );
+
+            let auth_path = home.join(".codex").join("auth.json");
+            let config_path = home.join(".codex").join("config.toml");
+            let auth: Value = read_json_file(&auth_path).expect("read codex auth");
+            let config = fs::read_to_string(config_path).expect("read codex config");
+            assert_eq!(auth["OPENAI_API_KEY"], json!("test-key-b"));
+            assert!(config.contains("https://b.example/v1"));
+        });
+    }
+
+    #[test]
     fn extract_credentials_returns_expected_values() {
         let provider = Provider::with_id(
             "claude".into(),
@@ -1442,6 +1505,10 @@ impl ProviderService {
             )
             .map_err(|e| AppError::Message(format!("热切换失败: {e}")))?;
 
+            if matches!(app_type, AppType::Codex) {
+                crate::services::codex_desktop::restart_codex_app()?;
+            }
+
             // Note: No Live config write, no MCP sync
             // The proxy server will route requests to the new provider via is_current
             return Ok(SwitchResult::default());
@@ -1514,6 +1581,13 @@ impl ProviderService {
                     }
                 }
             }
+        }
+
+        if matches!(app_type, AppType::Codex) {
+            crate::services::codex_desktop::switch_desktop_to_provider(
+                state, provider, None, true,
+            )?;
+            return Ok(result);
         }
 
         // Additive mode apps skip setting is_current (no such concept)

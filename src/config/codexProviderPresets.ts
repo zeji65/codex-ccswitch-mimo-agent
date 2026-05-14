@@ -17,6 +17,9 @@ export interface CodexProviderPreset {
   partnerPromotionKey?: string; // 合作伙伴促销信息的 i18n key
   category?: ProviderCategory; // 新增：分类
   isCustomTemplate?: boolean; // 标识是否为自定义模板
+  // 供应商类型标识（用于特殊供应商检测）
+  // - "codex_oauth": 官方 ChatGPT Plus/Pro 账号（需要 OAuth 认证）
+  providerType?: "codex_oauth";
   // 新增：请求地址候选列表（用于地址管理/测速）
   endpointCandidates?: string[];
   // 新增：视觉主题配置
@@ -68,6 +71,7 @@ export const codexProviderPresets: CodexProviderPreset[] = [
     websiteUrl: "https://chatgpt.com/codex",
     isOfficial: true,
     category: "official",
+    providerType: "codex_oauth",
     auth: {},
     config: ``,
     theme: {

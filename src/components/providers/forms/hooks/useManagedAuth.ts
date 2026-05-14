@@ -137,6 +137,8 @@ export function useManagedAuth(
         provider: authProvider,
         authenticated: false,
         default_account_id: null,
+        current_account_id: null,
+        current_account_login: null,
         accounts: [],
       });
       await queryClient.invalidateQueries({ queryKey });
@@ -173,6 +175,31 @@ export function useManagedAuth(
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to set default account:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const importCurrentMutation = useMutation({
+    mutationFn: () => authApi.authImportCurrent(authProvider),
+    onSuccess: async () => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to import current account:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const switchCurrentAccountMutation = useMutation({
+    mutationFn: (accountId?: string | null) =>
+      authApi.authSwitchCurrentAccount(authProvider, accountId),
+    onSuccess: async () => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to switch current account:", e);
       setError(e instanceof Error ? e.message : String(e));
     },
   });
@@ -219,6 +246,8 @@ export function useManagedAuth(
     hasAnyAccount: accounts.length > 0,
     isAuthenticated: authStatus?.authenticated ?? false,
     defaultAccountId: authStatus?.default_account_id ?? null,
+    currentAccountId: authStatus?.current_account_id ?? null,
+    currentAccountLogin: authStatus?.current_account_login ?? null,
     migrationError: authStatus?.migration_error ?? null,
     pollingState,
     deviceCode,
@@ -227,12 +256,16 @@ export function useManagedAuth(
     isAddingAccount: startLoginMutation.isPending || pollingState === "polling",
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
+    isImportingCurrentAccount: importCurrentMutation.isPending,
+    isSwitchingCurrentAccount: switchCurrentAccountMutation.isPending,
     startAuth,
     addAccount: startAuth,
     cancelAuth,
     logout,
     removeAccount,
     setDefaultAccount,
+    importCurrentAccount: importCurrentMutation.mutateAsync,
+    switchCurrentAccount: switchCurrentAccountMutation.mutateAsync,
     refetchStatus,
   };
 }

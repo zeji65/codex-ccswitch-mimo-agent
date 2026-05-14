@@ -18,6 +18,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -129,6 +130,37 @@ struct OAuthTokenResponse {
     expires_in: Option<i64>,
 }
 
+/// Codex 原生 auth.json 结构（用于切换 Codex Desktop 登录态）
+#[derive(Debug, Clone, Deserialize)]
+struct NativeCodexAuth {
+    #[serde(default)]
+    auth_mode: Option<String>,
+    #[serde(default)]
+    tokens: Option<NativeCodexTokens>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NativeCodexTokens {
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NativeCodexAccountSnapshot {
+    account_id: String,
+    email: Option<String>,
+    id_token: Option<String>,
+    refresh_token: String,
+    access_token: Option<String>,
+    native_auth: Value,
+}
+
 /// 解析后的 JWT claims（仅关心 chatgpt_account_id 等字段）
 #[derive(Debug, Clone, Default, Deserialize)]
 struct IdTokenClaims {
@@ -185,8 +217,14 @@ struct CodexAccountData {
     /// 账号邮箱（如果可获取）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// 最近一次拿到的 id_token，用于生成 Codex 原生 auth.json
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
     /// Refresh Token（持久化）
     pub refresh_token: String,
+    /// 持久化的原生 auth.json 快照，供 Codex Desktop 切号直接复用
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_auth: Option<Value>,
     /// 认证时间戳（秒）
     pub authenticated_at: i64,
 }
@@ -208,7 +246,7 @@ impl From<&CodexAccountData> for GitHubAccount {
     }
 }
 
-/// 持久化存储结构（v1）
+/// 持久化存储结构（v2，兼容 v1 缺省字段）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CodexOAuthStore {
     #[serde(default)]
@@ -418,8 +456,21 @@ impl CodexOAuthManager {
             );
         }
 
+        let native_auth = build_native_auth_json(
+            &account_id,
+            &tokens.access_token,
+            &refresh_token,
+            tokens.id_token.as_deref(),
+        );
+
         let account = self
-            .add_account_internal(account_id, refresh_token, email)
+            .add_account_internal(
+                account_id,
+                refresh_token,
+                tokens.id_token,
+                email,
+                Some(native_auth),
+            )
             .await?;
 
         Ok(Some(account))
@@ -539,16 +590,39 @@ impl CodexOAuthManager {
 
         let new_tokens = self.refresh_with_token(&refresh_token).await?;
 
-        // 如果服务端返回了新的 refresh_token，更新存储
-        if let Some(new_refresh) = new_tokens.refresh_token.clone() {
-            if new_refresh != refresh_token {
-                let mut accounts = self.accounts.write().await;
-                if let Some(account) = accounts.get_mut(account_id) {
-                    account.refresh_token = new_refresh;
+        let mut should_save = false;
+        {
+            let mut accounts = self.accounts.write().await;
+            if let Some(account) = accounts.get_mut(account_id) {
+                if let Some(new_refresh) = new_tokens.refresh_token.clone() {
+                    if new_refresh != account.refresh_token {
+                        account.refresh_token = new_refresh;
+                        should_save = true;
+                    }
                 }
-                drop(accounts);
-                self.save_to_disk().await?;
+
+                if let Some(id_token) = new_tokens.id_token.clone() {
+                    if account.id_token.as_ref() != Some(&id_token) {
+                        account.id_token = Some(id_token);
+                        should_save = true;
+                    }
+                }
+
+                let native_auth = build_native_auth_json(
+                    account_id,
+                    &new_tokens.access_token,
+                    &account.refresh_token,
+                    account.id_token.as_deref(),
+                );
+                if account.native_auth.as_ref() != Some(&native_auth) {
+                    account.native_auth = Some(native_auth);
+                    should_save = true;
+                }
             }
+        }
+
+        if should_save {
+            self.save_to_disk().await?;
         }
 
         let access_token = new_tokens.access_token.clone();
@@ -581,6 +655,64 @@ impl CodexOAuthManager {
     /// 获取默认账号 ID（热路径使用，避免克隆整个账号 HashMap）
     pub async fn default_account_id(&self) -> Option<String> {
         self.resolve_default_account_id().await
+    }
+
+    /// 生成 Codex Desktop / CLI 可识别的原生 auth.json。
+    ///
+    /// 优先复用导入或登录时持久化的原生快照，避免猜测 Codex auth.json
+    /// 字段；若当前 runtime 正好是目标账号，会先同步一次快照。
+    pub async fn build_native_auth(
+        &self,
+        preferred_account_id: Option<&str>,
+    ) -> Result<Value, CodexOAuthError> {
+        let account_id = match preferred_account_id {
+            Some(id) => id.to_string(),
+            None => self.resolve_default_account_id().await.ok_or_else(|| {
+                CodexOAuthError::AccountNotFound("无可用的 ChatGPT 账号".to_string())
+            })?,
+        };
+
+        if let Err(err) = self.sync_current_native_auth_for_account(&account_id).await {
+            log::debug!(
+                "[CodexOAuth] 跳过当前 runtime auth 切号同步（account={account_id}）: {err}"
+            );
+        }
+
+        let snapshot = self
+            .read_persisted_native_auth_snapshot(&account_id)
+            .await?;
+        if snapshot.account_id != account_id {
+            return Err(CodexOAuthError::ParseError(format!(
+                "该账号的持久化 auth.json 快照与账号 ID 不一致，无法直接切换（expected={account_id}, actual={})",
+                snapshot.account_id
+            )));
+        }
+
+        if snapshot.id_token.is_none() {
+            return Err(CodexOAuthError::ParseError(
+                "该账号的持久化 auth.json 快照缺少 id_token，无法生成 Codex 原生登录态。请先在 Codex 中登录该账号，再回到 CC Switch 重新导入".to_string(),
+            ));
+        }
+
+        Ok(snapshot.native_auth)
+    }
+
+    /// 从当前 Codex 原生 `~/.codex/auth.json` 导入当前登录账号。
+    pub async fn import_current_native_auth(&self) -> Result<GitHubAccount, CodexOAuthError> {
+        let snapshot = read_current_native_auth_snapshot()?;
+        self.upsert_native_account_snapshot(snapshot, true)
+            .await?
+            .ok_or_else(|| CodexOAuthError::ParseError("导入当前 Codex 登录失败".to_string()))
+    }
+
+    /// 若当前运行中的 Codex 账号已在账号池中，则同步最新 auth.json 快照。
+    ///
+    /// 不会静默新增陌生账号，只回补已受管账号的 token / id_token / email。
+    pub async fn sync_current_native_auth_if_tracked(
+        &self,
+    ) -> Result<Option<GitHubAccount>, CodexOAuthError> {
+        let snapshot = read_current_native_auth_snapshot()?;
+        self.upsert_native_account_snapshot(snapshot, false).await
     }
 
     // ==================== 多账号管理 ====================
@@ -701,14 +833,18 @@ impl CodexOAuthManager {
         &self,
         account_id: String,
         refresh_token: String,
+        id_token: Option<String>,
         email: Option<String>,
+        native_auth: Option<Value>,
     ) -> Result<GitHubAccount, CodexOAuthError> {
         let now = chrono::Utc::now().timestamp();
 
         let data = CodexAccountData {
             account_id: account_id.clone(),
             email,
+            id_token,
             refresh_token,
+            native_auth,
             authenticated_at: now,
         };
 
@@ -728,6 +864,103 @@ impl CodexOAuthManager {
 
         self.save_to_disk().await?;
         Ok(account)
+    }
+
+    async fn sync_current_native_auth_for_account(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<GitHubAccount>, CodexOAuthError> {
+        let snapshot = read_current_native_auth_snapshot()?;
+        if snapshot.account_id != account_id {
+            return Ok(None);
+        }
+        self.upsert_native_account_snapshot(snapshot, false).await
+    }
+
+    async fn upsert_native_account_snapshot(
+        &self,
+        snapshot: NativeCodexAccountSnapshot,
+        allow_new_account: bool,
+    ) -> Result<Option<GitHubAccount>, CodexOAuthError> {
+        let NativeCodexAccountSnapshot {
+            account_id,
+            email,
+            id_token,
+            refresh_token,
+            access_token,
+            native_auth,
+        } = snapshot;
+
+        let mut should_save = false;
+
+        let existing_account = {
+            let mut accounts = self.accounts.write().await;
+            if let Some(account) = accounts.get_mut(&account_id) {
+                if account.refresh_token != refresh_token {
+                    account.refresh_token = refresh_token.clone();
+                    should_save = true;
+                }
+
+                if let Some(native_id_token) = id_token.as_ref() {
+                    if account.id_token.as_ref() != Some(native_id_token) {
+                        account.id_token = Some(native_id_token.clone());
+                        should_save = true;
+                    }
+                }
+
+                if let Some(native_email) = email.as_ref() {
+                    if account.email.as_ref() != Some(native_email) {
+                        account.email = Some(native_email.clone());
+                        should_save = true;
+                    }
+                }
+
+                if account.native_auth.as_ref() != Some(&native_auth) {
+                    account.native_auth = Some(native_auth.clone());
+                    should_save = true;
+                }
+
+                Some(GitHubAccount::from(&*account))
+            } else {
+                None
+            }
+        };
+
+        let account = match existing_account {
+            Some(account) => account,
+            None => {
+                if !allow_new_account {
+                    return Ok(None);
+                }
+
+                self.add_account_internal(
+                    account_id.clone(),
+                    refresh_token,
+                    id_token,
+                    email,
+                    Some(native_auth),
+                )
+                .await?
+            }
+        };
+
+        if should_save {
+            self.save_to_disk().await?;
+        }
+
+        if let Some(access_token) = access_token {
+            let mut tokens_cache = self.access_tokens.write().await;
+            tokens_cache.insert(
+                account_id,
+                CachedAccessToken {
+                    token: access_token,
+                    // Runtime auth token is only a snapshot; force refresh on real use.
+                    expires_at_ms: chrono::Utc::now().timestamp_millis(),
+                },
+            );
+        }
+
+        Ok(Some(account))
     }
 
     fn fallback_default_account_id(accounts: &HashMap<String, CodexAccountData>) -> Option<String> {
@@ -888,6 +1121,28 @@ impl CodexOAuthManager {
 
         Ok(())
     }
+
+    async fn read_persisted_native_auth_snapshot(
+        &self,
+        account_id: &str,
+    ) -> Result<NativeCodexAccountSnapshot, CodexOAuthError> {
+        let stored_native_auth = {
+            let accounts = self.accounts.read().await;
+            let account = accounts
+                .get(account_id)
+                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?;
+            account.native_auth.clone()
+        };
+
+        let native_auth = stored_native_auth.ok_or_else(|| {
+            CodexOAuthError::ParseError(
+                "该账号缺少持久化 auth.json 快照，无法直接切换。请先导入当前 Codex 登录或重新登录"
+                    .to_string(),
+            )
+        })?;
+
+        parse_native_auth_snapshot(native_auth, "账号池中的持久化 auth.json 快照")
+    }
 }
 
 /// Codex OAuth 状态摘要
@@ -918,6 +1173,121 @@ fn compute_expires_at_ms(expires_in: Option<i64>) -> i64 {
     let now_ms = chrono::Utc::now().timestamp_millis();
     let secs = expires_in.unwrap_or(3600);
     now_ms + secs * 1000
+}
+
+fn build_native_auth_json(
+    account_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+    id_token: Option<&str>,
+) -> Value {
+    let mut tokens = serde_json::Map::new();
+    if let Some(token) = id_token {
+        tokens.insert("id_token".to_string(), Value::String(token.to_string()));
+    }
+    tokens.insert(
+        "access_token".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    tokens.insert(
+        "refresh_token".to_string(),
+        Value::String(refresh_token.to_string()),
+    );
+    tokens.insert(
+        "account_id".to_string(),
+        Value::String(account_id.to_string()),
+    );
+
+    serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": Value::Null,
+        "tokens": Value::Object(tokens),
+        "last_refresh": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    })
+}
+
+fn parse_native_auth_snapshot(
+    native_auth: Value,
+    source: &str,
+) -> Result<NativeCodexAccountSnapshot, CodexOAuthError> {
+    let native: NativeCodexAuth = serde_json::from_value(native_auth.clone())
+        .map_err(|e| CodexOAuthError::ParseError(format!("解析{source}失败: {e}")))?;
+
+    if native.auth_mode.as_deref() != Some("chatgpt") {
+        return Err(CodexOAuthError::ParseError(format!(
+            "{source}不是 ChatGPT OAuth 登录态"
+        )));
+    }
+
+    let tokens = native
+        .tokens
+        .ok_or_else(|| CodexOAuthError::ParseError(format!("{source}缺少 tokens 字段")))?;
+
+    let refresh_token = tokens
+        .refresh_token
+        .clone()
+        .ok_or_else(|| CodexOAuthError::ParseError(format!("{source}缺少 refresh_token")))?;
+
+    let account_id = tokens
+        .account_id
+        .clone()
+        .or_else(|| {
+            tokens
+                .id_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        })
+        .or_else(|| {
+            tokens
+                .access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        })
+        .ok_or_else(|| CodexOAuthError::ParseError(format!("无法从{source}中解析 account_id")))?;
+
+    let email = tokens
+        .id_token
+        .as_deref()
+        .and_then(parse_jwt_claims)
+        .and_then(|claims| claims.email)
+        .or_else(|| {
+            tokens
+                .access_token
+                .as_deref()
+                .and_then(parse_jwt_claims)
+                .and_then(|claims| claims.email)
+        });
+
+    Ok(NativeCodexAccountSnapshot {
+        account_id,
+        email,
+        id_token: tokens.id_token,
+        refresh_token,
+        access_token: tokens.access_token,
+        native_auth,
+    })
+}
+
+fn read_current_native_auth_snapshot() -> Result<NativeCodexAccountSnapshot, CodexOAuthError> {
+    let auth_path = crate::codex_config::get_codex_auth_path();
+    let content = fs::read_to_string(&auth_path)?;
+    let native_auth: Value = serde_json::from_str(&content)
+        .map_err(|e| CodexOAuthError::ParseError(format!("解析 Codex auth.json 失败: {e}")))?;
+
+    parse_native_auth_snapshot(native_auth, "当前 Codex auth.json")
+}
+
+fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let claims = parse_jwt_claims(token)?;
+    claims
+        .chatgpt_account_id
+        .or_else(|| {
+            claims
+                .openai_auth
+                .as_ref()
+                .and_then(|a| a.chatgpt_account_id.clone())
+        })
+        .or_else(|| claims.organizations.first().and_then(|o| o.id.clone()))
 }
 
 /// 解析 JWT 中的 claims
@@ -1070,6 +1440,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_build_native_auth_json_shape() {
+        let auth = build_native_auth_json("acc-123", "at", "rt", Some("id"));
+
+        assert_eq!(auth["auth_mode"], "chatgpt");
+        assert!(auth["OPENAI_API_KEY"].is_null());
+        assert_eq!(auth["tokens"]["account_id"], "acc-123");
+        assert_eq!(auth["tokens"]["access_token"], "at");
+        assert_eq!(auth["tokens"]["refresh_token"], "rt");
+        assert_eq!(auth["tokens"]["id_token"], "id");
+        assert!(auth["last_refresh"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_parse_native_auth_snapshot_requires_chatgpt_auth() {
+        let err = parse_native_auth_snapshot(
+            serde_json::json!({
+                "auth_mode": "apikey",
+                "tokens": {
+                    "account_id": "acc-123",
+                    "refresh_token": "rt"
+                }
+            }),
+            "测试 auth.json",
+        )
+        .expect_err("non-chatgpt auth should be rejected");
+
+        assert!(err.to_string().contains("不是 ChatGPT OAuth 登录态"));
+    }
+
     #[tokio::test]
     async fn test_manager_initial_state() {
         let temp = tempfile::tempdir().unwrap();
@@ -1090,7 +1490,9 @@ mod tests {
                 .add_account_internal(
                     "acc-123".to_string(),
                     "rt-secret".to_string(),
+                    None,
                     Some("user@example.com".to_string()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1112,7 +1514,9 @@ mod tests {
             .add_account_internal(
                 "acc-123".to_string(),
                 "rt".to_string(),
+                None,
                 Some("a@example.com".to_string()),
+                None,
             )
             .await
             .unwrap();
@@ -1120,7 +1524,9 @@ mod tests {
             .add_account_internal(
                 "acc-456".to_string(),
                 "rt2".to_string(),
+                None,
                 Some("b@example.com".to_string()),
+                None,
             )
             .await
             .unwrap();
