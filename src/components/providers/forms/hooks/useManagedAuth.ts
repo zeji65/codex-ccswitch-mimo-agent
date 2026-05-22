@@ -184,6 +184,13 @@ export function useManagedAuth(
     onSuccess: async () => {
       await refetchStatus();
       await queryClient.invalidateQueries({ queryKey });
+      // Invalidate quota queries so cards showing "session expired" re-fetch
+      // with the freshly imported tokens.
+      if (authProvider === "codex_oauth") {
+        await queryClient.invalidateQueries({ queryKey: ["codex_oauth"] });
+      } else if (authProvider === "github_copilot") {
+        await queryClient.invalidateQueries({ queryKey: ["github_copilot"] });
+      }
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to import current account:", e);

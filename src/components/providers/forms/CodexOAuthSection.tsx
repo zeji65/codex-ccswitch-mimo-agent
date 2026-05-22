@@ -21,9 +21,11 @@ import {
   X,
   Sparkles,
   User,
+  Download,
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
 import { copyText } from "@/lib/clipboard";
+import { toast } from "sonner";
 
 interface CodexOAuthSectionProps {
   className?: string;
@@ -64,11 +66,13 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isAddingAccount,
     isRemovingAccount,
     isSettingDefaultAccount,
+    isImportingCurrentAccount,
     addAccount,
     removeAccount,
     setDefaultAccount,
     cancelAuth,
     logout,
+    importCurrentAccount,
   } = useCodexOauth();
 
   const copyUserCode = async () => {
@@ -89,6 +93,26 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     removeAccount(accountId);
     if (selectedAccountId === accountId) {
       onAccountSelect?.(null);
+    }
+  };
+
+  const handleImportCurrent = async () => {
+    try {
+      const account = await importCurrentAccount();
+      toast.success(
+        t("codexOauth.importCurrentSuccess", {
+          login: account.login,
+          defaultValue: `已导入当前登录账号: ${account.login}`,
+        }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(
+        t("codexOauth.importCurrentFailed", {
+          error: msg,
+          defaultValue: `导入当前登录失败: ${msg}`,
+        }),
+      );
     }
   };
 
@@ -249,6 +273,27 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
         >
           <Plus className="mr-2 h-4 w-4" />
           {t("codexOauth.addAnotherAccount", "添加其他账号")}
+        </Button>
+      )}
+
+      {/* 导入当前 Codex 登录（用于 token 过期后从 ~/.codex/auth.json 重新拉取） */}
+      {pollingState === "idle" && (
+        <Button
+          type="button"
+          onClick={handleImportCurrent}
+          className="w-full"
+          variant="outline"
+          disabled={isImportingCurrentAccount}
+        >
+          {isImportingCurrentAccount ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="mr-2 h-4 w-4" />
+          )}
+          {t(
+            "codexOauth.importCurrent",
+            "导入当前 Codex 登录（~/.codex/auth.json）",
+          )}
         </Button>
       )}
 
