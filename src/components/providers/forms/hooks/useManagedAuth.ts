@@ -48,6 +48,18 @@ export function useManagedAuth(
     }
   }, []);
 
+  /**
+   * Invalidate the quota query cache for this auth provider so cards
+   * (e.g. "会话已过期") refetch immediately after token state changes.
+   */
+  const invalidateQuotaCache = useCallback(async () => {
+    if (authProvider === "codex_oauth") {
+      await queryClient.invalidateQueries({ queryKey: ["codex_oauth"] });
+    } else if (authProvider === "github_copilot") {
+      await queryClient.invalidateQueries({ queryKey: ["github_copilot"] });
+    }
+  }, [authProvider, queryClient]);
+
   useEffect(() => {
     return () => {
       stopPolling();
@@ -97,6 +109,9 @@ export function useManagedAuth(
             setPollingState("success");
             await refetchStatus();
             await queryClient.invalidateQueries({ queryKey });
+            // Invalidate quota cache so cards stuck on "会话已过期" refetch
+            // immediately with the freshly issued OAuth tokens.
+            await invalidateQuotaCache();
             setPollingState("idle");
             setDeviceCode(null);
           }
@@ -159,6 +174,7 @@ export function useManagedAuth(
       setError(null);
       await refetchStatus();
       await queryClient.invalidateQueries({ queryKey });
+      await invalidateQuotaCache();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to remove account:", e);
@@ -172,6 +188,7 @@ export function useManagedAuth(
     onSuccess: async () => {
       await refetchStatus();
       await queryClient.invalidateQueries({ queryKey });
+      await invalidateQuotaCache();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to set default account:", e);
@@ -184,13 +201,7 @@ export function useManagedAuth(
     onSuccess: async () => {
       await refetchStatus();
       await queryClient.invalidateQueries({ queryKey });
-      // Invalidate quota queries so cards showing "session expired" re-fetch
-      // with the freshly imported tokens.
-      if (authProvider === "codex_oauth") {
-        await queryClient.invalidateQueries({ queryKey: ["codex_oauth"] });
-      } else if (authProvider === "github_copilot") {
-        await queryClient.invalidateQueries({ queryKey: ["github_copilot"] });
-      }
+      await invalidateQuotaCache();
     },
     onError: (e) => {
       console.error("[ManagedAuth] Failed to import current account:", e);
