@@ -172,9 +172,6 @@ struct IdTokenClaims {
     organizations: Vec<OrgClaim>,
     #[serde(default, rename = "https://api.openai.com/auth")]
     openai_auth: Option<OpenAiAuthClaim>,
-    /// JWT 标准 exp 字段（Unix 秒时间戳）
-    #[serde(default)]
-    exp: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -952,25 +949,13 @@ impl CodexOAuthManager {
         }
 
         if let Some(access_token) = access_token {
-            // Trust the JWT's exp claim from the imported access_token instead of
-            // forcing immediate refresh. The refresh_token in ~/.codex/auth.json
-            // may have already been consumed by Codex Desktop and is single-use,
-            // so we cannot rely on refreshing it again — but the access_token
-            // itself is still valid for hours.
-            let expires_at_ms = parse_jwt_claims(&access_token)
-                .and_then(|claims| claims.exp)
-                .map(|exp_secs| exp_secs * 1000)
-                // Fallback: if no exp claim, give it 1 hour from now (typical OpenAI token lifetime)
-                .unwrap_or_else(|| {
-                    chrono::Utc::now().timestamp_millis() + 60 * 60 * 1000
-                });
-
             let mut tokens_cache = self.access_tokens.write().await;
             tokens_cache.insert(
                 account_id,
                 CachedAccessToken {
                     token: access_token,
-                    expires_at_ms,
+                    // Runtime auth token is only a snapshot; force refresh on real use.
+                    expires_at_ms: chrono::Utc::now().timestamp_millis(),
                 },
             );
         }
