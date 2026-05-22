@@ -1584,6 +1584,18 @@ impl ProviderService {
         }
 
         if matches!(app_type, AppType::Codex) {
+            // Sync the currently-running Codex account's latest auth.json snapshot
+            // back into CC Switch before switching away. This keeps the leaving
+            // account's refresh_token chain intact so the user can switch back
+            // later without re-importing.
+            //
+            // Failures are non-fatal: the sync helper logs and returns gracefully
+            // if ~/.codex/auth.json is missing, malformed, or refers to an
+            // untracked account.
+            futures::executor::block_on(
+                crate::services::codex_desktop::sync_tracked_runtime_auth_before_switch(),
+            );
+
             crate::services::codex_desktop::switch_desktop_to_provider(
                 state, provider, None, true,
             )?;

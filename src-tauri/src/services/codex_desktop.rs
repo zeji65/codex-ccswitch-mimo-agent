@@ -284,7 +284,7 @@ fn validate_target_auth(settings: &Value) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn sync_tracked_runtime_auth_before_switch() {
+pub async fn sync_tracked_runtime_auth_before_switch() {
     let manager = CodexOAuthManager::new(crate::config::get_app_config_dir());
     match manager.sync_current_native_auth_if_tracked().await {
         Ok(Some(account)) => {
