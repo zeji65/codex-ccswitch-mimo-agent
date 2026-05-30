@@ -588,7 +588,37 @@ impl CodexOAuthManager {
                 .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?
         };
 
-        let new_tokens = self.refresh_with_token(&refresh_token).await?;
+        // The refresh_token may be empty or already consumed by another client
+        // (e.g. Codex Desktop running concurrently — OpenAI refresh_tokens are
+        // single-use and rotate on every refresh). In that case, fall back to the
+        // access_token persisted in the native_auth snapshot, which is often still
+        // valid for hours even when the refresh_token is dead.
+        let new_tokens = match self.refresh_with_token(&refresh_token).await {
+            Ok(tokens) => tokens,
+            Err(refresh_err) => {
+                if let Some(token) = self
+                    .persisted_access_token_for_account(account_id)
+                    .await
+                {
+                    log::warn!(
+                        "[CodexOAuth] 账号 {account_id} 刷新失败（{refresh_err}），回退使用持久化 access_token"
+                    );
+                    // Cache the fallback token with a short TTL so we re-evaluate
+                    // soon, but don't hammer the dead refresh endpoint every call.
+                    let mut tokens = self.access_tokens.write().await;
+                    tokens.insert(
+                        account_id.to_string(),
+                        CachedAccessToken {
+                            token: token.clone(),
+                            expires_at_ms: chrono::Utc::now().timestamp_millis()
+                                + 5 * 60 * 1000,
+                        },
+                    );
+                    return Ok(token);
+                }
+                return Err(refresh_err);
+            }
+        };
 
         let mut should_save = false;
         {
@@ -1120,6 +1150,22 @@ impl CodexOAuthManager {
         );
 
         Ok(())
+    }
+
+    /// Read the access_token persisted in the account's native_auth snapshot.
+    /// Returns None if the account has no snapshot or no access_token in it.
+    /// Used as a fallback when the refresh_token is dead (consumed by another
+    /// client) but the cached access_token may still be accepted by the server.
+    async fn persisted_access_token_for_account(&self, account_id: &str) -> Option<String> {
+        let accounts = self.accounts.read().await;
+        let account = accounts.get(account_id)?;
+        let native_auth = account.native_auth.as_ref()?;
+        native_auth
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
     }
 
     async fn read_persisted_native_auth_snapshot(
