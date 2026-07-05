@@ -73,6 +73,7 @@
 | DEC-015 | 2026-07-05 | A012 核心二开能力保留清单完成；Codex OAuth 账号池、导入当前登录、账号切换、quota 展示、proxy forwarder 路径均有代码和测试证据 | command output + code inspection | A012 | 未发现本地二开能力被上游合并吞掉；未使用真实 token 或生产 DB | 继续 A013 审查和 secret scan |
 | DEC-016 | 2026-07-05 | A013 审查与 changed diff secret scan 完成；未发现 P0/P1，secret scan 命中均为公开示例、文档锚点、测试/占位值 | command output + redacted inspection | A013 | 当前集成结果无阻断审查项；仍未做真实 GUI/真实账号手动验证 | 继续 A014 状态维护 |
 | DEC-017 | 2026-07-05 | A014 更新 `docs/PROJECT-README.md`：版本/schema 从 `3.14.1`/`10` 修正为 `3.16.5`/`11`，并补 Codex OAuth quota/models 锚点 | source inspection + docs patch | A014 | 未来 agent 不会按旧版本/schema 或缺失锚点行动；`docs/WORKFLOW-SOP.md` 无需改动 | 继续 A015 最终交付和合回决策 |
+| DEC-018 | 2026-07-05 | A015 已创建集成 merge commit `17c11194c50a9b6209fedd6245a1ed0e1fa3d2e8`，父提交为 `95bcc897` 和 `7a7d41c8` | command output | A015 | `origin/main` 已进入集成分支；工作区在提交后干净；合回 `正式版V2` 和推送仍需用户确认 | 任务完成，等待用户决定是否合回/推送 |
 
 ## A003 Protection Inventory
 
@@ -468,8 +469,8 @@ quality_gate:
     - name: final report
       command_or_check: final response and Decision Log
       expected: completion, verification, residual risk, and merge-back options stated
-      actual: planned
-      result: planned
+      actual: Decision Log records merge commit; final response will state completion, verification, residual risk, and merge-back/push options
+      result: pass
       skip_reason: none
   required_pass:
     - review and secret scan
@@ -530,9 +531,8 @@ forbidden replay:
 
 ```yaml
 resume_anchor:
-  current_round: A05 in progress
-  next_task_ids:
-    - A015
+  current_round: complete
+  next_task_ids: []
   last_completed_task_ids:
     - A001
     - A002
@@ -548,6 +548,7 @@ resume_anchor:
     - A012
     - A013
     - A014
+    - A015
   required_sources_to_reload:
     - /Users/huzeji/cc-switch/AGENTS.md
     - /Users/huzeji/cc-switch/docs/PROJECT-README.md
@@ -562,10 +563,9 @@ resume_anchor:
     - /Users/huzeji/cc-switch/docs/superpowers/plans/2026-07-05-sync-origin-main-long-task-plan.md
     - /Users/huzeji/cc-switch/docs/PROJECT-README.md
   decision_log_location: Decision Log section in this plan
-  last_quality_gate: Gate R5 review/secret scan and state maintenance passed; final report/merge commit pending
+  last_quality_gate: Gate R5 review/secret scan, state maintenance, and integration merge commit passed
   open_gaps:
     - AMB-004 merge back and push decision
-    - A015 final report, integration merge commit, and merge-back recommendation
   side_effects_done:
     - created this plan file
     - fetched origin; origin/main is now 7a7d41c873c1efe32d9caf4733f44c57d3a07fee
@@ -582,13 +582,14 @@ resume_anchor:
     - completed A012 capability preservation checklist with targeted frontend/Rust tests
     - completed A013 review and changed-diff secret scan; matches classified as false positives/placeholders
     - updated docs/PROJECT-README.md for current version/schema and Codex OAuth quota/models anchors
+    - created integration merge commit 17c11194c50a9b6209fedd6245a1ed0e1fa3d2e8 on codex/sync-origin-main-2026-07-05
   forbidden_replay:
     - do not create duplicate WIP commit or stash for A004
     - do not rerun merge if A006 already left a conflict state unless idempotency is checked
     - do not run `git merge --abort` unless user explicitly chooses to abandon this merge attempt
     - do not rerun secret-bearing inspections into logs
     - do not push, force push, reset, or delete files without explicit decision log approval
-  safe_next_action: create the integration merge commit on codex/sync-origin-main-2026-07-05, then report merge-back/push options without performing them
+  safe_next_action: ask user whether to merge codex/sync-origin-main-2026-07-05 back into 正式版V2 and/or push; do not do either automatically
 ```
 
 ## Downstream Skill Routing
