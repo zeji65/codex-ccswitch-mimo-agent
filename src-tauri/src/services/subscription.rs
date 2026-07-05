@@ -32,6 +32,12 @@ pub struct QuotaTier {
     pub utilization: f64,
     /// ISO 8601 重置时间
     pub resets_at: Option<String>,
+    /// ZenMux: 已用额度（USD）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_value_usd: Option<f64>,
+    /// ZenMux: 窗口上限（USD）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_value_usd: Option<f64>,
 }
 
 /// 超额使用信息
@@ -301,6 +307,17 @@ pub const TIER_SEVEN_DAY_SONNET: &str = "seven_day_sonnet";
 /// 写入、tray 渲染、commands::provider 扁平化三处共用同一标识。
 pub const TIER_WEEKLY_LIMIT: &str = "weekly_limit";
 
+/// 月窗口 tier 名。火山方舟 Agent Plan / Coding Plan 有 5h / 周 / 月 三个展示
+/// 窗口（Kimi / MiniMax 只有 5h + 周），月窗口共用此标识；前端 `TIER_I18N_KEYS`
+/// 映射到 `subscription.monthly`。
+pub const TIER_MONTHLY: &str = "monthly";
+
+/// Codex 免费方案的 30 天（月）滚动窗口 tier 名。付费方案的次要窗口是 7 天
+/// (`seven_day`)，免费方案则是 30 天。由 `window_seconds_to_tier_name` 产出、
+/// tray 的月分组渲染、前端 `TIER_I18N_KEYS` 映射到 `subscription.thirtyDay`
+/// 三处共用同一标识。见 #3651。
+pub const TIER_THIRTY_DAY: &str = "30_day";
+
 /// Gemini 用量分组名称（按模型而非时间窗口）。`classify_gemini_model` 输出。
 pub const TIER_GEMINI_PRO: &str = "gemini_pro";
 pub const TIER_GEMINI_FLASH: &str = "gemini_flash";
@@ -322,7 +339,7 @@ async fn query_claude_quota(access_token: &str) -> SubscriptionQuota {
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("Accept", "application/json")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
 
@@ -377,6 +394,8 @@ async fn query_claude_quota(access_token: &str) -> SubscriptionQuota {
                         name: tier_name.to_string(),
                         utilization: util,
                         resets_at: w.resets_at,
+                        used_value_usd: None,
+                        max_value_usd: None,
                     });
                 }
             }
@@ -395,6 +414,8 @@ async fn query_claude_quota(access_token: &str) -> SubscriptionQuota {
                         name: key.clone(),
                         utilization: util,
                         resets_at: w.resets_at,
+                        used_value_usd: None,
+                        max_value_usd: None,
                     });
                 }
             }
@@ -617,8 +638,12 @@ struct CodexUsageResponse {
 /// 根据窗口秒数映射到 tier 名称（与 Claude 的命名兼容以复用前端 i18n）
 fn window_seconds_to_tier_name(secs: i64) -> String {
     match secs {
-        18000 => "five_hour".to_string(),
-        604800 => "seven_day".to_string(),
+        18000 => TIER_FIVE_HOUR.to_string(),
+        604800 => TIER_SEVEN_DAY.to_string(),
+        // Codex 免费方案的 30 天窗口。显式映射到常量，与 tray 月分组、前端
+        // TIER_I18N_KEYS 保持同一标识（否则动态回退虽也得到 "30_day"，但字符串
+        // 分散在多处、易和托盘/前端白名单脱节）。见 #3651。
+        2_592_000 => TIER_THIRTY_DAY.to_string(),
         s => {
             let hours = s / 3600;
             if hours >= 24 {
@@ -658,7 +683,7 @@ pub(crate) async fn query_codex_quota(
         req = req.header("ChatGPT-Account-Id", id);
     }
 
-    let resp = match req.timeout(std::time::Duration::from_secs(10)).send().await {
+    let resp = match req.timeout(std::time::Duration::from_secs(15)).send().await {
         Ok(r) => r,
         Err(e) => {
             return SubscriptionQuota::error(
@@ -714,6 +739,8 @@ pub(crate) async fn query_codex_quota(
                         .unwrap_or_else(|| "unknown".to_string()),
                     utilization: used,
                     resets_at: window.reset_at.and_then(unix_ts_to_iso),
+                    used_value_usd: None,
+                    max_value_usd: None,
                 });
             }
         }
@@ -952,7 +979,7 @@ async fn refresh_gemini_token(refresh_token: &str) -> Option<String> {
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
         .ok()?;
@@ -1036,7 +1063,7 @@ async fn query_gemini_quota(access_token: &str) -> SubscriptionQuota {
                 "pluginType": "GEMINI"
             }
         }))
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
 
@@ -1097,7 +1124,7 @@ async fn query_gemini_quota(access_token: &str) -> SubscriptionQuota {
         .header("Authorization", format!("Bearer {access_token}"))
         .header("Content-Type", "application/json")
         .json(&quota_body)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
 
@@ -1179,6 +1206,8 @@ async fn query_gemini_quota(access_token: &str) -> SubscriptionQuota {
             name,
             utilization: (1.0 - remaining) * 100.0,
             resets_at: reset_time,
+            used_value_usd: None,
+            max_value_usd: None,
         })
         .collect();
 
@@ -1320,4 +1349,22 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_seconds_map_to_expected_tier_names() {
+        // 官方特例窗口
+        assert_eq!(window_seconds_to_tier_name(18000), TIER_FIVE_HOUR);
+        assert_eq!(window_seconds_to_tier_name(604800), TIER_SEVEN_DAY);
+        // Codex 免费方案的次要窗口是 30 天（30 * 24 * 3600 = 2_592_000 秒）。
+        // 前端 TIER_I18N_KEYS 与 tray 月分组都需要认得 "30_day"，见 #3651。
+        assert_eq!(window_seconds_to_tier_name(2_592_000), TIER_THIRTY_DAY);
+        // 其他窗口按小时/天回退命名
+        assert_eq!(window_seconds_to_tier_name(3600), "1_hour");
+        assert_eq!(window_seconds_to_tier_name(86400), "1_day");
+    }
 }

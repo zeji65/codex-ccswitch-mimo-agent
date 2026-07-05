@@ -64,6 +64,15 @@
 | DEC-006 | 2026-07-05 | A003 保护清单完成；本地 tracked 改动 14 个文件、untracked 8 个文件；明显长 key/token 模式扫描无匹配文件 | command output | A003 | 下一步必须选择 WIP commit、stash 或人工整理 | 从 A004 前的 AMB-003 HALT 继续 |
 | DEC-007 | 2026-07-05 | 用户选择保护方式 1：WIP commit | user | A004 | 使用保护分支和 WIP commit 保护当前二开改动 | 已创建保护分支 `codex/protect-v2-wip-2026-07-05` |
 | DEC-008 | 2026-07-05 | 已在保护分支创建 WIP 保护提交 `4edebc6592b9fed01a865ebe3007320ba2ac83b3` | command output | A004 | 当前二开改动已形成可恢复快照，`正式版V2` 指针未被推进 | 继续 A005 创建集成分支 |
+| DEC-009 | 2026-07-05 | 已从受保护状态创建集成分支 `codex/sync-origin-main-2026-07-05` | command output | A005 | 集成工作与保护分支分离 | 继续 A006 merge |
+| DEC-010 | 2026-07-05 | 已执行 `git merge --no-commit --no-ff origin/main`，merge 停在冲突状态，无 merge commit | command output | A006 | 官方更新已展开到集成分支；剩余 8 个冲突文件 | 继续 A007 风险地图 |
+| DEC-011 | 2026-07-05 | A008 已解决 2 个前端 Standard 冲突：`ProviderCard.tsx` 和 `ProviderForm.tsx` | command output | A008 | 保留本地 Codex OAuth/managed account UI，同时接入上游 Codex Chat routing/API format/catalog/custom headers 字段 | A009 需处理后端 Strict/Mixed 冲突 |
+| DEC-012 | 2026-07-05 | 用户要求“继续处理 A009”；A009 后端 Mixed/Strict 冲突已按手工融合策略解决 | user + command output | A009 | 保留本地 Codex Desktop 重启、Codex tail repair、Live re-takeover 行为，同时接入上游 ActiveConnectionGuard、Codex Chat transform、catalog/display 更新和 Claude placeholder cleanup | 继续 A010/A011 验证 |
+| DEC-013 | 2026-07-05 | A010 前端验证通过：`pnpm typecheck`，以及 `ProviderForm.codexCatalog`、`ProviderCardLayout`、`useCodexConfigState.catalog` 定向测试 | command output | A010 | 前端类型和冲突相关 UI/Hook 测试通过 | 继续 A012 能力保留清单 |
+| DEC-014 | 2026-07-05 | A011 Rust 验证通过：`cargo fmt --check`、`cargo check`、`cargo test hot_switch_codex`、`cargo test codex_tail_repair`、`cargo test switch_codex_provider_writes_live_config_and_current_markers` | command output | A011 | 后端冲突融合可格式化、可编译，Codex 热切换和 tail repair 定向回归通过 | 继续 A012 能力保留清单 |
+| DEC-015 | 2026-07-05 | A012 核心二开能力保留清单完成；Codex OAuth 账号池、导入当前登录、账号切换、quota 展示、proxy forwarder 路径均有代码和测试证据 | command output + code inspection | A012 | 未发现本地二开能力被上游合并吞掉；未使用真实 token 或生产 DB | 继续 A013 审查和 secret scan |
+| DEC-016 | 2026-07-05 | A013 审查与 changed diff secret scan 完成；未发现 P0/P1，secret scan 命中均为公开示例、文档锚点、测试/占位值 | command output + redacted inspection | A013 | 当前集成结果无阻断审查项；仍未做真实 GUI/真实账号手动验证 | 继续 A014 状态维护 |
+| DEC-017 | 2026-07-05 | A014 更新 `docs/PROJECT-README.md`：版本/schema 从 `3.14.1`/`10` 修正为 `3.16.5`/`11`，并补 Codex OAuth quota/models 锚点 | source inspection + docs patch | A014 | 未来 agent 不会按旧版本/schema 或缺失锚点行动；`docs/WORKFLOW-SOP.md` 无需改动 | 继续 A015 最终交付和合回决策 |
 
 ## A003 Protection Inventory
 
@@ -103,6 +112,81 @@ A003 evidence:
 - Direct tracked overlap with upstream: `src-tauri/src/lib.rs`, `src-tauri/src/proxy/forwarder.rs`, `src-tauri/src/proxy/providers/codex_oauth_auth.rs`, `src-tauri/tauri.conf.json`, `src/components/providers/ProviderCard.tsx`, `src/lib/api/settings.ts`, `src/lib/query/subscription.ts`.
 - Direct untracked overlap with upstream: none.
 - Long `sk-...`, `tp-...`, JWT-like key scan over changed/untracked files: no matching file.
+
+## A006 / A007 Conflict Risk Map
+
+Merge command:
+
+```bash
+git merge --no-commit --no-ff origin/main
+```
+
+Merge result: automatic merge failed; no merge commit was created.
+
+| File | Conflict Count | Category | Risk | Current Status | Required Decision |
+|---|---|---|---|---|---|
+| `src/components/providers/ProviderCard.tsx` | 1 | provider UI / quota / routing badge | Standard | resolved and staged | Keep both local Codex OAuth quota logic and upstream Codex routing badge logic |
+| `src/components/providers/forms/ProviderForm.tsx` | 1 | provider form UI | Standard | resolved and staged | Keep local `CodexOAuthSection` and upstream Codex `apiFormat`, reasoning, catalog, user-agent, request override fields |
+| `src-tauri/src/provider.rs` | 1 | provider model / usage result | Mixed | resolved and staged | Kept local `UsageResult::not_supported` helpers while preserving upstream ProviderTestConfig wording |
+| `src-tauri/src/services/mod.rs` | 1 | service module exports | Mixed | resolved and staged | Included both local `codex_desktop` and upstream `codex_oauth_models` exports |
+| `src-tauri/src/services/provider/mod.rs` | 2 | provider switching / tests / live config | Strict | resolved and staged | Preserved local Codex Desktop restart on switch and upstream provider/common-config tests/validation behavior |
+| `src-tauri/src/proxy/handlers.rs` | 2 | proxy request/response handling | Strict | resolved and staged | Preserved local Codex tail repair path while using upstream Codex Chat-to-Responses transform where routing requires it |
+| `src-tauri/src/proxy/response_processor.rs` | 1 | response processor / SSE logging | Strict | resolved and staged | Fused local Codex tail repair stream with upstream `ActiveConnectionGuard` lifetime handling |
+| `src-tauri/src/services/proxy.rs` | 8 | proxy service / live takeover / backup/restore | Strict | resolved and staged | Preserved local Codex Live re-takeover behavior while keeping upstream catalog/display update and Claude placeholder cleanup behavior |
+
+A008 Standard resolution evidence:
+
+- Conflict-marker search over `ProviderCard.tsx` and `ProviderForm.tsx` produced no matches.
+- `git diff --check -- src/components/providers/ProviderCard.tsx src/components/providers/forms/ProviderForm.tsx` passed.
+- Both resolved frontend files were staged with `git add`.
+
+A009 backend resolution evidence:
+
+- Conflict-marker search over all 8 conflict files produced no matches.
+- `git diff --check` over the 6 backend conflict files passed.
+- `git diff --name-only --diff-filter=U` returned no files.
+- `src-tauri/src/proxy/handlers.rs` keeps the upstream Codex Chat-to-Responses transform for routed Codex Chat providers, and uses local Codex tail repair for native Codex Responses passthrough.
+- `src-tauri/src/proxy/response_processor.rs` now passes `ActiveConnectionGuard` through streaming, non-streaming, and Codex tail repair paths.
+- `src-tauri/src/services/proxy.rs` keeps Codex Live takeover reapplication when backup exists but Live drifted direct, while retaining upstream provider display/catalog updates and Claude placeholder cleanup.
+
+A010 / A011 validation evidence:
+
+- `pnpm typecheck` passed.
+- `pnpm vitest run tests/components/ProviderForm.codexCatalog.test.ts tests/components/ProviderCardLayout.test.ts tests/hooks/useCodexConfigState.catalog.test.ts` passed: 3 files, 5 tests.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` passed.
+- `cargo check --manifest-path src-tauri/Cargo.toml` passed.
+- `cargo test hot_switch_codex --manifest-path src-tauri/Cargo.toml` passed: 3 tests.
+- `cargo test codex_tail_repair --manifest-path src-tauri/Cargo.toml` passed: 2 tests.
+- `cargo test switch_codex_provider_writes_live_config_and_current_markers --manifest-path src-tauri/Cargo.toml` passed: 1 test.
+
+A012 capability preservation checklist:
+
+| Capability | Evidence | Validation | Residual Risk |
+|---|---|---|---|
+| Codex OAuth 账号池 | `src-tauri/src/proxy/providers/codex_oauth_auth.rs` still owns `CodexOAuthManager`, account store, default account, external JSON import, duplicate protection, native auth snapshot, token refresh, upstream account id mapping | `cargo test codex_oauth --manifest-path src-tauri/Cargo.toml` passed 40 tests | 未使用真实账号登录流；网络 OAuth 端到端需人工验证 |
+| 导入当前 Codex 登录 | UI `CodexOAuthSection` calls `useManagedAuth.importCurrentAccount`; frontend API invokes `auth_import_current`; Rust command calls `import_current_native_auth` | `pnpm vitest run tests/components/CodexOAuthSection.importJson.test.tsx ...` passed; `cargo test codex_oauth` includes native snapshot parsing tests | 未读取真实 `~/.codex/auth.json`，避免暴露 token |
+| 账号切换 / 默认账号 | `useManagedAuth` still exposes `setDefaultAccount` and `switchCurrentAccount`; Rust `auth_switch_current_account` calls Codex Desktop switch path and records `authBinding` | `cargo test managed_account --manifest-path src-tauri/Cargo.toml` passed 9 tests; `cargo test set_codex_account_binding --manifest-path src-tauri/Cargo.toml` passed | 未实际重启/切换真实 Codex Desktop |
+| quota 展示 | `ProviderCard.tsx` detects `meta.authBinding.source=managed_account` + `authProvider=codex_oauth`; `CodexOauthQuotaFooter` uses `useCodexOauthQuota` and account id resolution | Codex OAuth quota frontend tests passed 4 files / 7 tests | quota API 网络返回未用真实账号验证 |
+| proxy forwarder | `src-tauri/src/proxy/forwarder.rs` still resolves managed Codex OAuth account, fetches token from `CodexOAuthManager`, injects upstream `chatgpt-account-id`, session cache headers, and rejects proxy placeholder upstream | `cargo test codex_oauth` includes session header and placeholder guard tests; `cargo test managed_account` includes takeover placeholder tests | 未跑真实上游请求，避免使用真实 token |
+
+A013 review and secret scan evidence:
+
+- Conflict fusion review checked `process_response`, `process_response_with_codex_tail_repair`, Codex Chat transform call sites, `ActiveConnectionGuard` propagation, Codex hot-switch/takeover paths, and Claude placeholder cleanup call sites.
+- `git diff --cached --name-only --diff-filter=U` returned no files.
+- `git diff --cached --check` passed.
+- Staged conflict-marker scan over changed text files produced no matches.
+- Changed-diff secret scan initially flagged potential patterns; redacted inspection classified them as false positives:
+  - `sk-` pattern matched markdown anchor text such as `disk-...`.
+  - AWS key pattern matched public S3 example/test credentials.
+  - sensitive assignment pattern matched docs, i18n placeholders, and tests using fake values.
+- Review finding: no P0/P1 blocking findings found. Residual risk: no real GUI session, real Codex OAuth account, or real upstream proxy request was exercised.
+
+A014 state maintenance evidence:
+
+- State surfaces checked: `docs/PROJECT-README.md`, `docs/WORKFLOW-SOP.md`, package manifests, database schema version source.
+- `docs/PROJECT-README.md` updated because its version/schema anchors were stale after the upstream sync: `3.14.1` → `3.16.5`, `SCHEMA_VERSION 10` → `11`.
+- `docs/PROJECT-README.md` also now lists Codex OAuth quota/models command and service anchors.
+- `docs/WORKFLOW-SOP.md` required no change: workflow steps and validation thresholds remain accurate.
 
 ## Autonomy Model
 
@@ -306,20 +390,20 @@ quality_gate:
     - name: conflict risk map
       command_or_check: inspect unmerged files and AGENTS Risk Gate
       expected: every conflict file has risk level and planned handling
-      actual: planned
-      result: planned
+      actual: 8 conflict files classified in A006 / A007 Conflict Risk Map
+      result: pass
       skip_reason: none
     - name: Standard conflicts resolved
       command_or_check: git status unmerged list excludes Standard conflict files
       expected: Standard conflicts resolved without unrelated formatting
-      actual: planned
-      result: planned
+      actual: ProviderCard.tsx and ProviderForm.tsx resolved and staged
+      result: pass
       skip_reason: none
     - name: Strict decisions logged
       command_or_check: Decision Log rows for every Strict conflict
       expected: no Strict conflict is resolved without user decision
-      actual: planned
-      result: planned
+      actual: DEC-012 records user continuation request and manual fusion strategy for all backend Mixed/Strict conflicts
+      result: pass
       skip_reason: none
   required_pass:
     - conflict risk map
@@ -339,20 +423,20 @@ quality_gate:
     - name: frontend validation
       command_or_check: pnpm typecheck and targeted pnpm vitest run commands
       expected: pass or failure root cause recorded
-      actual: planned
-      result: planned
+      actual: pnpm typecheck passed; targeted vitest command passed 3 files / 5 tests
+      result: pass
       skip_reason: none
     - name: Rust validation
       command_or_check: cargo test or cargo check with src-tauri/Cargo.toml
       expected: pass or failure root cause recorded
-      actual: planned
-      result: planned
+      actual: cargo fmt --check, cargo check, and 3 targeted cargo test filters passed
+      result: pass
       skip_reason: none
     - name: capability preservation checklist
       command_or_check: inspect Codex OAuth, quota, provider card, auth API, proxy paths
       expected: every core二开能力 has evidence or residual risk
-      actual: planned
-      result: planned
+      actual: Codex OAuth account pool, import current login, account switching, quota display, and proxy forwarder paths have code and targeted test evidence
+      result: pass
       skip_reason: none
   required_pass:
     - frontend validation
@@ -372,14 +456,14 @@ quality_gate:
     - name: review and secret scan
       command_or_check: git diff review plus changed-file secret scan
       expected: no P0 or P1 findings and no real-looking secret
-      actual: planned
-      result: planned
+      actual: no P0/P1 findings; changed-diff secret scan hits were redacted and classified as examples/placeholders/tests/markdown false positives
+      result: pass
       skip_reason: none
     - name: state maintenance decision
       command_or_check: compare final diff with docs/PROJECT-README.md and docs/WORKFLOW-SOP.md
       expected: docs updated only if operation paths changed, otherwise skip reason recorded
-      actual: planned
-      result: planned
+      actual: docs/PROJECT-README.md updated for version/schema and Codex OAuth quota/models anchors; docs/WORKFLOW-SOP.md unchanged with skip reason
+      result: pass
       skip_reason: none
     - name: final report
       command_or_check: final response and Decision Log
@@ -446,15 +530,24 @@ forbidden replay:
 
 ```yaml
 resume_anchor:
-  current_round: A02 before A005
+  current_round: A05 in progress
   next_task_ids:
-    - A005
-    - A006
+    - A015
   last_completed_task_ids:
     - A001
     - A002
     - A003
     - A004
+    - A005
+    - A006
+    - A007
+    - A008
+    - A009
+    - A010
+    - A011
+    - A012
+    - A013
+    - A014
   required_sources_to_reload:
     - /Users/huzeji/cc-switch/AGENTS.md
     - /Users/huzeji/cc-switch/docs/PROJECT-README.md
@@ -467,24 +560,35 @@ resume_anchor:
     - git rev-list --left-right --count HEAD...origin/main
   artifacts_changed:
     - /Users/huzeji/cc-switch/docs/superpowers/plans/2026-07-05-sync-origin-main-long-task-plan.md
+    - /Users/huzeji/cc-switch/docs/PROJECT-README.md
   decision_log_location: Decision Log section in this plan
-  last_quality_gate: Gate R2 protected worktree evidence exists; integration branch still pending
+  last_quality_gate: Gate R5 review/secret scan and state maintenance passed; final report/merge commit pending
   open_gaps:
     - AMB-004 merge back and push decision
-    - A005 integration branch
-    - A006 merge origin/main
+    - A015 final report, integration merge commit, and merge-back recommendation
   side_effects_done:
     - created this plan file
     - fetched origin; origin/main is now 7a7d41c873c1efe32d9caf4733f44c57d3a07fee
     - updated this plan with A001-A003 evidence
     - created protection branch codex/protect-v2-wip-2026-07-05
     - created WIP protection commit 4edebc6592b9fed01a865ebe3007320ba2ac83b3
+    - created progress commit 95bcc897cc4152cba3630d362cd81a9a668923df on protection branch
+    - created integration branch codex/sync-origin-main-2026-07-05
+    - attempted no-commit merge from origin/main; merge is currently in progress
+    - resolved and staged frontend Standard conflicts in ProviderCard.tsx and ProviderForm.tsx
+    - resolved and staged backend Mixed/Strict conflicts in provider.rs, services/mod.rs, services/provider/mod.rs, proxy/handlers.rs, proxy/response_processor.rs, and services/proxy.rs
+    - ran frontend validation: pnpm typecheck and targeted vitest passed
+    - ran Rust validation: cargo fmt --check, cargo check, and targeted cargo tests passed
+    - completed A012 capability preservation checklist with targeted frontend/Rust tests
+    - completed A013 review and changed-diff secret scan; matches classified as false positives/placeholders
+    - updated docs/PROJECT-README.md for current version/schema and Codex OAuth quota/models anchors
   forbidden_replay:
     - do not create duplicate WIP commit or stash for A004
     - do not rerun merge if A006 already left a conflict state unless idempotency is checked
+    - do not run `git merge --abort` unless user explicitly chooses to abandon this merge attempt
     - do not rerun secret-bearing inspections into logs
     - do not push, force push, reset, or delete files without explicit decision log approval
-  safe_next_action: create integration branch for A005 from current protected state
+  safe_next_action: create the integration merge commit on codex/sync-origin-main-2026-07-05, then report merge-back/push options without performing them
 ```
 
 ## Downstream Skill Routing

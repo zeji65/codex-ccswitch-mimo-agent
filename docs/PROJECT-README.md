@@ -36,12 +36,14 @@
 
 ## Current Architecture Anchors
 
-- 应用版本：以 `package.json` 和 `src-tauri/Cargo.toml` 为准；写本文时两者都是 `3.14.1`。
-- 数据库 schema：以 `src-tauri/src/database/mod.rs` 的 `SCHEMA_VERSION` 为准；写本文时源码为 `10`。
+- 应用版本：以 `package.json` 和 `src-tauri/Cargo.toml` 为准；写本文时两者都是 `3.16.5`。
+- 数据库 schema：以 `src-tauri/src/database/mod.rs` 的 `SCHEMA_VERSION` 为准；写本文时源码为 `11`。
 - 数据库迁移：`src-tauri/src/database/schema.rs`。
 - 数据库备份/导入/导出：`src-tauri/src/database/backup.rs`。
 - Codex OAuth 账号池：`src-tauri/src/proxy/providers/codex_oauth_auth.rs`。
 - Tauri auth command：`src-tauri/src/commands/auth.rs`。
+- Codex OAuth quota / models command：`src-tauri/src/commands/codex_oauth.rs`。
+- Codex OAuth models service：`src-tauri/src/services/codex_oauth_models.rs`。
 - 前端 auth API：`src/lib/api/auth.ts`。
 - Codex OAuth UI：`src/components/providers/forms/CodexOAuthSection.tsx`。
 - provider 表单状态：`src/components/providers/forms/hooks/useManagedAuth.ts`。
