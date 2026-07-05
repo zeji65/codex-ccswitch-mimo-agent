@@ -62,6 +62,8 @@
 | DEC-004 | 2026-07-05 | 用户要求“按计划执行” | user | A001-A003 | 授权开始执行第一轮；保护方式仍需在 A004 前确认 | 执行到 AMB-003 后 HALT |
 | DEC-005 | 2026-07-05 | 已执行 `git fetch origin`；`origin/main` 更新到 `7a7d41c873c1efe32d9caf4733f44c57d3a07fee` | command output | A002 | 当前分叉为 `ahead 6 / behind 384`，merge-base 为 `7685ab7049bbd447c155dd172ac67c769b33948c` | 继续 A003 保护清单 |
 | DEC-006 | 2026-07-05 | A003 保护清单完成；本地 tracked 改动 14 个文件、untracked 8 个文件；明显长 key/token 模式扫描无匹配文件 | command output | A003 | 下一步必须选择 WIP commit、stash 或人工整理 | 从 A004 前的 AMB-003 HALT 继续 |
+| DEC-007 | 2026-07-05 | 用户选择保护方式 1：WIP commit | user | A004 | 使用保护分支和 WIP commit 保护当前二开改动 | 已创建保护分支 `codex/protect-v2-wip-2026-07-05` |
+| DEC-008 | 2026-07-05 | 已在保护分支创建 WIP 保护提交 `4edebc6592b9fed01a865ebe3007320ba2ac83b3` | command output | A004 | 当前二开改动已形成可恢复快照，`正式版V2` 指针未被推进 | 继续 A005 创建集成分支 |
 
 ## A003 Protection Inventory
 
@@ -444,13 +446,15 @@ forbidden replay:
 
 ```yaml
 resume_anchor:
-  current_round: A01 halted before A004
+  current_round: A02 before A005
   next_task_ids:
-    - A004
+    - A005
+    - A006
   last_completed_task_ids:
     - A001
     - A002
     - A003
+    - A004
   required_sources_to_reload:
     - /Users/huzeji/cc-switch/AGENTS.md
     - /Users/huzeji/cc-switch/docs/PROJECT-README.md
@@ -464,23 +468,23 @@ resume_anchor:
   artifacts_changed:
     - /Users/huzeji/cc-switch/docs/superpowers/plans/2026-07-05-sync-origin-main-long-task-plan.md
   decision_log_location: Decision Log section in this plan
-  last_quality_gate: Gate R1 source reload, refreshed git facts, and protection inventory completed; protection method still pending
+  last_quality_gate: Gate R2 protected worktree evidence exists; integration branch still pending
   open_gaps:
-    - AMB-003 protection method
     - AMB-004 merge back and push decision
-    - A004 protection action
     - A005 integration branch
     - A006 merge origin/main
   side_effects_done:
     - created this plan file
     - fetched origin; origin/main is now 7a7d41c873c1efe32d9caf4733f44c57d3a07fee
     - updated this plan with A001-A003 evidence
+    - created protection branch codex/protect-v2-wip-2026-07-05
+    - created WIP protection commit 4edebc6592b9fed01a865ebe3007320ba2ac83b3
   forbidden_replay:
-    - do not create duplicate WIP commit or stash if A004 already recorded one
+    - do not create duplicate WIP commit or stash for A004
     - do not rerun merge if A006 already left a conflict state unless idempotency is checked
     - do not rerun secret-bearing inspections into logs
     - do not push, force push, reset, or delete files without explicit decision log approval
-  safe_next_action: ask user to choose WIP commit, stash, or manual cleanup for A004
+  safe_next_action: create integration branch for A005 from current protected state
 ```
 
 ## Downstream Skill Routing
