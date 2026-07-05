@@ -189,8 +189,12 @@ export function ProviderCard({
   // read-only here — writes have to go through Hermes Web UI.
   const isHermesReadOnly =
     appId === "hermes" && isHermesReadOnlyProvider(provider.settingsConfig);
+  const hasManagedCodexBinding =
+    provider.meta?.authBinding?.source === "managed_account" &&
+    provider.meta?.authBinding?.authProvider === PROVIDER_TYPES.CODEX_OAUTH;
   const isCodexOauth =
     provider.meta?.providerType === PROVIDER_TYPES.CODEX_OAUTH ||
+    hasManagedCodexBinding ||
     (appId === "codex" && provider.category === "official");
 
   // 获取用量数据以判断是否有多套餐

@@ -22,9 +22,11 @@ import {
   Sparkles,
   User,
   Download,
+  FileJson,
 } from "lucide-react";
 import { useCodexOauth } from "./hooks/useCodexOauth";
 import { copyText } from "@/lib/clipboard";
+import { settingsApi } from "@/lib/api";
 import { toast } from "sonner";
 
 interface CodexOAuthSectionProps {
@@ -54,6 +56,8 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
 }) => {
   const { t } = useTranslation();
   const [copied, setCopied] = React.useState(false);
+  const [isChoosingJsonAccount, setIsChoosingJsonAccount] =
+    React.useState(false);
 
   const {
     accounts,
@@ -67,12 +71,14 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
     isRemovingAccount,
     isSettingDefaultAccount,
     isImportingCurrentAccount,
+    isImportingJsonAccount,
     addAccount,
     removeAccount,
     setDefaultAccount,
     cancelAuth,
     logout,
     importCurrentAccount,
+    importJsonAccountFromFile,
   } = useCodexOauth();
 
   const copyUserCode = async () => {
@@ -113,6 +119,33 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
           defaultValue: `导入当前登录失败: ${msg}`,
         }),
       );
+    }
+  };
+
+  const handleImportJson = async () => {
+    try {
+      setIsChoosingJsonAccount(true);
+      const filePath = await settingsApi.openJsonFileDialog();
+      if (!filePath) {
+        return;
+      }
+      const account = await importJsonAccountFromFile(filePath, null);
+      toast.success(
+        t("codexOauth.importJsonSuccess", {
+          login: account.login,
+          defaultValue: `已导入账号: ${account.login}`,
+        }),
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(
+        t("codexOauth.importJsonFailed", {
+          error: msg,
+          defaultValue: `导入 JSON 账号失败: ${msg}`,
+        }),
+      );
+    } finally {
+      setIsChoosingJsonAccount(false);
     }
   };
 
@@ -294,6 +327,23 @@ export const CodexOAuthSection: React.FC<CodexOAuthSectionProps> = ({
             "codexOauth.importCurrent",
             "导入当前 Codex 登录（~/.codex/auth.json）",
           )}
+        </Button>
+      )}
+
+      {pollingState === "idle" && (
+        <Button
+          type="button"
+          onClick={handleImportJson}
+          className="w-full"
+          variant="outline"
+          disabled={isImportingJsonAccount || isChoosingJsonAccount}
+        >
+          {isImportingJsonAccount || isChoosingJsonAccount ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <FileJson className="mr-2 h-4 w-4" />
+          )}
+          {t("codexOauth.importJson", "导入 JSON 账号")}
         </Button>
       )}
 

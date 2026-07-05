@@ -97,6 +97,30 @@ export async function authImportCurrent(
   });
 }
 
+export async function authImportJsonAccount(
+  authProvider: ManagedAuthProvider,
+  jsonContent: string,
+  displayName?: string | null,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_import_json_account", {
+    authProvider,
+    jsonContent,
+    displayName: displayName || null,
+  });
+}
+
+export async function authImportJsonAccountFile(
+  authProvider: ManagedAuthProvider,
+  filePath: string,
+  displayName?: string | null,
+): Promise<ManagedAuthAccount> {
+  return invoke<ManagedAuthAccount>("auth_import_json_account_file", {
+    authProvider,
+    filePath,
+    displayName: displayName || null,
+  });
+}
+
 export async function authSwitchCurrentAccount(
   authProvider: ManagedAuthProvider,
   accountId?: string | null,
@@ -123,6 +147,8 @@ export const authApi = {
   authRemoveAccount,
   authSetDefaultAccount,
   authImportCurrent,
+  authImportJsonAccount,
+  authImportJsonAccountFile,
   authSwitchCurrentAccount,
   authLogout,
 };

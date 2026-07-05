@@ -83,14 +83,18 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     #[allow(non_snake_case)] defaultName: String,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("SQL", &["sql"])
-        .set_file_name(&defaultName)
-        .blocking_save_file();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog();
+        let result = dialog
+            .file()
+            .add_filter("SQL", &["sql"])
+            .set_file_name(&defaultName)
+            .blocking_save_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
+    .map_err(|e| format!("打开保存对话框失败: {e}"))?
 }
 
 /// 打开文件对话框
@@ -98,13 +102,35 @@ pub async fn save_file_dialog<R: tauri::Runtime>(
 pub async fn open_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("SQL", &["sql"])
-        .blocking_pick_file();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog();
+        let result = dialog
+            .file()
+            .add_filter("SQL", &["sql"])
+            .blocking_pick_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
+    .map_err(|e| format!("打开文件对话框失败: {e}"))?
+}
+
+/// 打开 JSON 文件选择对话框
+#[tauri::command]
+pub async fn open_json_file_dialog<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog();
+        let result = dialog
+            .file()
+            .add_filter("JSON", &["json"])
+            .blocking_pick_file();
+
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
+    .map_err(|e| format!("打开 JSON 文件对话框失败: {e}"))?
 }
 
 /// 打开 ZIP 文件选择对话框
@@ -112,13 +138,17 @@ pub async fn open_file_dialog<R: tauri::Runtime>(
 pub async fn open_zip_file_dialog<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Option<String>, String> {
-    let dialog = app.dialog();
-    let result = dialog
-        .file()
-        .add_filter("ZIP / Skill", &["zip", "skill"])
-        .blocking_pick_file();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dialog = app.dialog();
+        let result = dialog
+            .file()
+            .add_filter("ZIP / Skill", &["zip", "skill"])
+            .blocking_pick_file();
 
-    Ok(result.map(|p| p.to_string()))
+        Ok(result.map(|p| p.to_string()))
+    })
+    .await
+    .map_err(|e| format!("打开 ZIP 文件对话框失败: {e}"))?
 }
 
 // ─── Database backup management ─────────────────────────────

@@ -209,6 +209,45 @@ export function useManagedAuth(
     },
   });
 
+  const importJsonAccountMutation = useMutation({
+    mutationFn: ({
+      jsonContent,
+      displayName,
+    }: {
+      jsonContent: string;
+      displayName?: string | null;
+    }) => authApi.authImportJsonAccount(authProvider, jsonContent, displayName),
+    onSuccess: async () => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+      await invalidateQuotaCache();
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to import JSON account:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const importJsonAccountFileMutation = useMutation({
+    mutationFn: ({
+      filePath,
+      displayName,
+    }: {
+      filePath: string;
+      displayName?: string | null;
+    }) =>
+      authApi.authImportJsonAccountFile(authProvider, filePath, displayName),
+    onSuccess: async () => {
+      await refetchStatus();
+      await queryClient.invalidateQueries({ queryKey });
+      await invalidateQuotaCache();
+    },
+    onError: (e) => {
+      console.error("[ManagedAuth] Failed to import JSON account file:", e);
+      setError(e instanceof Error ? e.message : String(e));
+    },
+  });
+
   const switchCurrentAccountMutation = useMutation({
     mutationFn: (accountId?: string | null) =>
       authApi.authSwitchCurrentAccount(authProvider, accountId),
@@ -275,6 +314,9 @@ export function useManagedAuth(
     isRemovingAccount: removeAccountMutation.isPending,
     isSettingDefaultAccount: setDefaultAccountMutation.isPending,
     isImportingCurrentAccount: importCurrentMutation.isPending,
+    isImportingJsonAccount:
+      importJsonAccountMutation.isPending ||
+      importJsonAccountFileMutation.isPending,
     isSwitchingCurrentAccount: switchCurrentAccountMutation.isPending,
     startAuth,
     addAccount: startAuth,
@@ -283,6 +325,12 @@ export function useManagedAuth(
     removeAccount,
     setDefaultAccount,
     importCurrentAccount: importCurrentMutation.mutateAsync,
+    importJsonAccount: (jsonContent: string, displayName?: string | null) =>
+      importJsonAccountMutation.mutateAsync({ jsonContent, displayName }),
+    importJsonAccountFromFile: (
+      filePath: string,
+      displayName?: string | null,
+    ) => importJsonAccountFileMutation.mutateAsync({ filePath, displayName }),
     switchCurrentAccount: switchCurrentAccountMutation.mutateAsync,
     refetchStatus,
   };

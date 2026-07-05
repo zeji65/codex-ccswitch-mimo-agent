@@ -1124,10 +1124,19 @@ impl RequestForwarder {
                         Ok(token) => {
                             auth = AuthInfo::new(token, AuthStrategy::CodexOAuth);
                             should_send_codex_oauth_session_headers = true;
-                            // 解析使用的 account_id（用于注入 ChatGPT-Account-Id header）
-                            codex_oauth_account_id = match account_id {
-                                Some(id) => Some(id),
-                                None => codex_auth.default_account_id().await,
+                            // 注入上游真实 account_id，而不是 CC Switch 管理槽位 ID。
+                            // 外部账号池 JSON 可能多个邮箱共用同一个上游 account_id。
+                            codex_oauth_account_id = match account_id.as_deref() {
+                                Some(id) => codex_auth.upstream_account_id_for_account(id).await,
+                                None => {
+                                    let default_id = codex_auth.default_account_id().await;
+                                    match default_id.as_deref() {
+                                        Some(id) => {
+                                            codex_auth.upstream_account_id_for_account(id).await
+                                        }
+                                        None => None,
+                                    }
+                                }
                             };
                             log::debug!(
                                 "[CodexOAuth] 成功获取 access_token (account={})",

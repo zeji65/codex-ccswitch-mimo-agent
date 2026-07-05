@@ -2,10 +2,13 @@ import { useQuery } from "@tanstack/react-query";
 import { subscriptionApi } from "@/lib/api/subscription";
 import type { AppId } from "@/lib/api/types";
 import type { ProviderMeta } from "@/types";
+import type { SubscriptionQuota } from "@/types/subscription";
 import { resolveManagedAccountId } from "@/lib/authBinding";
 import { PROVIDER_TYPES } from "@/config/constants";
 
 const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+export const CODEX_OAUTH_REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+export const CODEX_OAUTH_FAST_REFETCH_INTERVAL = 60 * 1000; // 1 minute
 
 export const subscriptionKeys = {
   all: ["subscription"] as const,
@@ -35,6 +38,16 @@ export interface UseCodexOauthQuotaOptions {
   autoQuery?: boolean;
 }
 
+export function getCodexOauthQuotaRefetchInterval(
+  quota: SubscriptionQuota | undefined,
+) {
+  if (quota?.success && (quota.tiers?.length ?? 0) > 0) {
+    return CODEX_OAUTH_REFETCH_INTERVAL;
+  }
+
+  return CODEX_OAUTH_FAST_REFETCH_INTERVAL;
+}
+
 /**
  * Codex OAuth (ChatGPT Plus/Pro 反代) 订阅额度查询 hook
  *
@@ -54,7 +67,12 @@ export function useCodexOauthQuota(
     queryKey: ["codex_oauth", "quota", accountId ?? "default"],
     queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
     enabled,
-    refetchInterval: autoQuery ? REFETCH_INTERVAL : false,
+    refetchInterval: autoQuery
+      ? (query) =>
+          getCodexOauthQuotaRefetchInterval(
+            query.state.data as SubscriptionQuota | undefined,
+          )
+      : false,
     refetchIntervalInBackground: autoQuery,
     refetchOnWindowFocus: autoQuery,
     staleTime: REFETCH_INTERVAL,

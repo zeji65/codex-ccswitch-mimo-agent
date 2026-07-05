@@ -19,13 +19,12 @@ interface CodexOauthQuotaFooterProps {
 const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
   meta,
   inline = false,
-  isCurrent = false,
 }) => {
   const {
     data: quota,
     isFetching: loading,
     refetch,
-  } = useCodexOauthQuota(meta, { enabled: true, autoQuery: isCurrent });
+  } = useCodexOauthQuota(meta, { enabled: true, autoQuery: true });
 
   return (
     <SubscriptionQuotaView

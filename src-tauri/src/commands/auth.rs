@@ -1,3 +1,4 @@
+use std::fs;
 use tauri::State;
 
 use crate::app_config::AppType;
@@ -399,6 +400,50 @@ pub async fn auth_import_current(
         AUTH_PROVIDER_GITHUB_COPILOT => Err("当前登录导入仅支持 Codex OAuth".to_string()),
         _ => unreachable!(),
     }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn auth_import_json_account(
+    auth_provider: String,
+    json_content: String,
+    display_name: Option<String>,
+    codex_state: State<'_, CodexOAuthState>,
+) -> Result<ManagedAuthAccount, String> {
+    let auth_provider = ensure_auth_provider(&auth_provider)?;
+    match auth_provider {
+        AUTH_PROVIDER_CODEX_OAUTH => {
+            let (account, default_account_id) = {
+                let auth_manager = codex_state.0.write().await;
+                let account = auth_manager
+                    .import_external_account_json(&json_content, display_name.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let default_account_id = auth_manager.get_status().await.default_account_id;
+                (account, default_account_id)
+            };
+
+            Ok(map_account(
+                auth_provider,
+                account,
+                default_account_id.as_deref(),
+            ))
+        }
+        AUTH_PROVIDER_GITHUB_COPILOT => Err("JSON 账号导入仅支持 Codex OAuth".to_string()),
+        _ => unreachable!(),
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn auth_import_json_account_file(
+    auth_provider: String,
+    file_path: String,
+    display_name: Option<String>,
+    codex_state: State<'_, CodexOAuthState>,
+) -> Result<ManagedAuthAccount, String> {
+    let json_content =
+        fs::read_to_string(&file_path).map_err(|e| format!("读取 JSON 账号文件失败: {e}"))?;
+
+    auth_import_json_account(auth_provider, json_content, display_name, codex_state).await
 }
 
 #[tauri::command(rename_all = "camelCase")]

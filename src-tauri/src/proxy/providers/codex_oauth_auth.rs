@@ -87,6 +87,9 @@ pub enum CodexOAuthError {
 
     #[error("账号不存在: {0}")]
     AccountNotFound(String),
+
+    #[error("账号已存在: {0}")]
+    AccountAlreadyExists(String),
 }
 
 impl From<reqwest::Error> for CodexOAuthError {
@@ -212,11 +215,20 @@ struct PendingDeviceCode {
 /// 持久化的账号数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CodexAccountData {
-    /// chatgpt_account_id（同时作为 HashMap 的 key）
+    /// CC Switch 管理用账号 ID（同时作为 HashMap 的 key）。
+    ///
+    /// 普通 OAuth 登录时与 ChatGPT 上游 account_id 相同；外部账号池 JSON 可能出现
+    /// 多个账号共用同一个上游 account_id，此时这里会保存一个可选择的唯一槽位 ID。
     pub account_id: String,
+    /// ChatGPT/Codex 上游真实 account_id。缺省时等于 account_id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_account_id: Option<String>,
     /// 账号邮箱（如果可获取）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    /// 用户自定义显示名。存在时优先于 email 用于 UI 展示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// 最近一次拿到的 id_token，用于生成 Codex 原生 auth.json
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_token: Option<String>,
@@ -229,15 +241,24 @@ struct CodexAccountData {
     pub authenticated_at: i64,
 }
 
+impl CodexAccountData {
+    fn upstream_account_id(&self) -> &str {
+        self.upstream_account_id
+            .as_deref()
+            .unwrap_or(&self.account_id)
+    }
+}
+
 /// 公开的账号信息（返回给前端，复用 GitHubAccount 结构）
 impl From<&CodexAccountData> for GitHubAccount {
     fn from(data: &CodexAccountData) -> Self {
         GitHubAccount {
             id: data.account_id.clone(),
-            // 用 email 作为显示名（若无则用 account_id）
+            // 用自定义显示名或 email 作为展示名（若无则用 account_id）
             login: data
-                .email
+                .display_name
                 .clone()
+                .or_else(|| data.email.clone())
                 .unwrap_or_else(|| format!("ChatGPT ({})", &data.account_id)),
             avatar_url: None,
             authenticated_at: data.authenticated_at,
@@ -255,6 +276,34 @@ struct CodexOAuthStore {
     accounts: HashMap<String, CodexAccountData>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ExternalCodexAccountJson {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalCodexAccountImport {
+    upstream_account_id: String,
+    refresh_token: String,
+    id_token: Option<String>,
+    email: Option<String>,
+    display_name: Option<String>,
+    native_auth: Option<Value>,
 }
 
 /// Codex OAuth 认证管理器（多账号）
@@ -469,6 +518,7 @@ impl CodexOAuthManager {
                 refresh_token,
                 tokens.id_token,
                 email,
+                None,
                 Some(native_auth),
             )
             .await?;
@@ -580,12 +630,15 @@ impl CodexOAuthManager {
             }
         }
 
-        let refresh_token = {
+        let (refresh_token, upstream_account_id) = {
             let accounts = self.accounts.read().await;
-            accounts
+            let account = accounts
                 .get(account_id)
-                .map(|a| a.refresh_token.clone())
-                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?
+                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?;
+            (
+                account.refresh_token.clone(),
+                account.upstream_account_id().to_string(),
+            )
         };
 
         // The refresh_token may be empty or already consumed by another client
@@ -596,10 +649,7 @@ impl CodexOAuthManager {
         let new_tokens = match self.refresh_with_token(&refresh_token).await {
             Ok(tokens) => tokens,
             Err(refresh_err) => {
-                if let Some(token) = self
-                    .persisted_access_token_for_account(account_id)
-                    .await
-                {
+                if let Some(token) = self.persisted_access_token_for_account(account_id).await {
                     log::warn!(
                         "[CodexOAuth] 账号 {account_id} 刷新失败（{refresh_err}），回退使用持久化 access_token"
                     );
@@ -610,8 +660,7 @@ impl CodexOAuthManager {
                         account_id.to_string(),
                         CachedAccessToken {
                             token: token.clone(),
-                            expires_at_ms: chrono::Utc::now().timestamp_millis()
-                                + 5 * 60 * 1000,
+                            expires_at_ms: chrono::Utc::now().timestamp_millis() + 5 * 60 * 1000,
                         },
                     );
                     return Ok(token);
@@ -639,7 +688,7 @@ impl CodexOAuthManager {
                 }
 
                 let native_auth = build_native_auth_json(
-                    account_id,
+                    &upstream_account_id,
                     &new_tokens.access_token,
                     &account.refresh_token,
                     account.id_token.as_deref(),
@@ -687,6 +736,14 @@ impl CodexOAuthManager {
         self.resolve_default_account_id().await
     }
 
+    /// 获取某个管理槽位对应的上游 ChatGPT account_id。
+    pub async fn upstream_account_id_for_account(&self, account_id: &str) -> Option<String> {
+        let accounts = self.accounts.read().await;
+        accounts
+            .get(account_id)
+            .map(|account| account.upstream_account_id().to_string())
+    }
+
     /// 生成 Codex Desktop / CLI 可识别的原生 auth.json。
     ///
     /// 优先复用导入或登录时持久化的原生快照，避免猜测 Codex auth.json
@@ -701,6 +758,9 @@ impl CodexOAuthManager {
                 CodexOAuthError::AccountNotFound("无可用的 ChatGPT 账号".to_string())
             })?,
         };
+        let upstream_account_id = self
+            .upstream_account_id_for_existing_account(&account_id)
+            .await?;
 
         if let Err(err) = self.sync_current_native_auth_for_account(&account_id).await {
             log::debug!(
@@ -711,9 +771,9 @@ impl CodexOAuthManager {
         let snapshot = self
             .read_persisted_native_auth_snapshot(&account_id)
             .await?;
-        if snapshot.account_id != account_id {
+        if snapshot.account_id != upstream_account_id {
             return Err(CodexOAuthError::ParseError(format!(
-                "该账号的持久化 auth.json 快照与账号 ID 不一致，无法直接切换（expected={account_id}, actual={})",
+                "该账号的持久化 auth.json 快照与账号 ID 不一致，无法直接切换（expected={upstream_account_id}, actual={})",
                 snapshot.account_id
             )));
         }
@@ -733,6 +793,36 @@ impl CodexOAuthManager {
         self.upsert_native_account_snapshot(snapshot, true)
             .await?
             .ok_or_else(|| CodexOAuthError::ParseError("导入当前 Codex 登录失败".to_string()))
+    }
+
+    /// 从外部 JSON 导入 Codex OAuth 账号。
+    ///
+    /// 这个入口用于受控导入已有的 account-pool JSON，不触发网络刷新，
+    /// 也不会修改已有默认账号。重复账号会显式失败，避免静默覆盖。
+    pub async fn import_external_account_json(
+        &self,
+        content: &str,
+        display_name: Option<&str>,
+    ) -> Result<GitHubAccount, CodexOAuthError> {
+        let import = parse_external_account_json(content, display_name)?;
+        let account_id = self.managed_account_id_for_external_import(&import).await?;
+
+        let upstream_account_id = if account_id == import.upstream_account_id {
+            None
+        } else {
+            Some(import.upstream_account_id)
+        };
+
+        self.add_account_record(
+            account_id,
+            upstream_account_id,
+            import.refresh_token,
+            import.id_token,
+            import.email,
+            import.display_name,
+            import.native_auth,
+        )
+        .await
     }
 
     /// 若当前运行中的 Codex 账号已在账号池中，则同步最新 auth.json 快照。
@@ -846,7 +936,7 @@ impl CodexOAuthManager {
         let username = default_id
             .as_ref()
             .and_then(|id| accounts_map.get(id))
-            .and_then(|a| a.email.clone())
+            .and_then(|a| a.display_name.clone().or_else(|| a.email.clone()))
             .or_else(|| account_list.first().map(|a| a.login.clone()));
 
         CodexOAuthStatus {
@@ -865,13 +955,38 @@ impl CodexOAuthManager {
         refresh_token: String,
         id_token: Option<String>,
         email: Option<String>,
+        display_name: Option<String>,
+        native_auth: Option<Value>,
+    ) -> Result<GitHubAccount, CodexOAuthError> {
+        self.add_account_record(
+            account_id,
+            None,
+            refresh_token,
+            id_token,
+            email,
+            display_name,
+            native_auth,
+        )
+        .await
+    }
+
+    async fn add_account_record(
+        &self,
+        account_id: String,
+        upstream_account_id: Option<String>,
+        refresh_token: String,
+        id_token: Option<String>,
+        email: Option<String>,
+        display_name: Option<String>,
         native_auth: Option<Value>,
     ) -> Result<GitHubAccount, CodexOAuthError> {
         let now = chrono::Utc::now().timestamp();
 
         let data = CodexAccountData {
             account_id: account_id.clone(),
+            upstream_account_id,
             email,
+            display_name,
             id_token,
             refresh_token,
             native_auth,
@@ -896,12 +1011,67 @@ impl CodexOAuthManager {
         Ok(account)
     }
 
+    async fn upstream_account_id_for_existing_account(
+        &self,
+        account_id: &str,
+    ) -> Result<String, CodexOAuthError> {
+        let accounts = self.accounts.read().await;
+        let account = accounts
+            .get(account_id)
+            .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?;
+        Ok(account.upstream_account_id().to_string())
+    }
+
+    async fn managed_account_id_for_external_import(
+        &self,
+        import: &ExternalCodexAccountImport,
+    ) -> Result<String, CodexOAuthError> {
+        let accounts = self.accounts.read().await;
+        let upstream_id = import.upstream_account_id.as_str();
+
+        if !accounts.contains_key(upstream_id) {
+            return Ok(upstream_id.to_string());
+        }
+
+        if let Some(email) = import.email.as_deref() {
+            if let Some((existing_id, _)) = accounts.iter().find(|(_, account)| {
+                account.upstream_account_id() == upstream_id
+                    && account.email.as_deref() == Some(email)
+            }) {
+                return Err(CodexOAuthError::AccountAlreadyExists(existing_id.clone()));
+            }
+        } else {
+            return Err(CodexOAuthError::AccountAlreadyExists(
+                upstream_id.to_string(),
+            ));
+        }
+
+        let suffix_source = import
+            .email
+            .as_deref()
+            .or(import.display_name.as_deref())
+            .ok_or_else(|| CodexOAuthError::AccountAlreadyExists(upstream_id.to_string()))?;
+        let suffix = sanitize_external_account_suffix(suffix_source);
+        let base = format!("{upstream_id}#{suffix}");
+        let mut candidate = base.clone();
+        let mut counter = 2;
+        while accounts.contains_key(&candidate) {
+            candidate = format!("{base}-{counter}");
+            counter += 1;
+        }
+
+        Ok(candidate)
+    }
+
     async fn sync_current_native_auth_for_account(
         &self,
         account_id: &str,
     ) -> Result<Option<GitHubAccount>, CodexOAuthError> {
         let snapshot = read_current_native_auth_snapshot()?;
-        if snapshot.account_id != account_id {
+        let upstream_account_id = self
+            .upstream_account_id_for_existing_account(account_id)
+            .await?;
+        if snapshot.account_id != upstream_account_id {
             return Ok(None);
         }
         self.upsert_native_account_snapshot(snapshot, false).await
@@ -968,6 +1138,7 @@ impl CodexOAuthManager {
                     refresh_token,
                     id_token,
                     email,
+                    None,
                     Some(native_auth),
                 )
                 .await?
@@ -1249,6 +1420,108 @@ fn build_native_auth_json(
         "OPENAI_API_KEY": Value::Null,
         "tokens": Value::Object(tokens),
         "last_refresh": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+    })
+}
+
+fn normalize_owned(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_str(value: Option<&str>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn sanitize_external_account_suffix(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '@' | '.' | '_' | '-' | '+') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        "external".to_string()
+    } else {
+        trimmed.chars().take(96).collect()
+    }
+}
+
+fn ensure_matching_account_id(
+    expected: &str,
+    actual: Option<String>,
+    source: &str,
+) -> Result<(), CodexOAuthError> {
+    if let Some(actual) = actual {
+        if actual != expected {
+            return Err(CodexOAuthError::ParseError(format!(
+                "{source} 中的 account_id 与 JSON account_id 不一致"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_external_account_json(
+    content: &str,
+    display_name: Option<&str>,
+) -> Result<ExternalCodexAccountImport, CodexOAuthError> {
+    let raw: ExternalCodexAccountJson = serde_json::from_str(content)
+        .map_err(|e| CodexOAuthError::ParseError(format!("解析导入 JSON 失败: {e}")))?;
+
+    let account_id = normalize_owned(raw.account_id);
+    let chatgpt_account_id = normalize_owned(raw.chatgpt_account_id);
+    if let (Some(account_id), Some(chatgpt_account_id)) = (&account_id, &chatgpt_account_id) {
+        if account_id != chatgpt_account_id {
+            return Err(CodexOAuthError::ParseError(
+                "account_id 与 chatgpt_account_id 不一致".to_string(),
+            ));
+        }
+    }
+
+    let access_token = normalize_owned(raw.access_token);
+    let id_token = normalize_owned(raw.id_token);
+    let token_account_id = id_token
+        .as_deref()
+        .and_then(extract_account_id_from_jwt)
+        .or_else(|| {
+            access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        });
+
+    let account_id = account_id
+        .or(chatgpt_account_id)
+        .or_else(|| token_account_id.clone())
+        .ok_or_else(|| CodexOAuthError::ParseError("导入 JSON 缺少 account_id".to_string()))?;
+
+    ensure_matching_account_id(&account_id, token_account_id, "token")?;
+
+    let refresh_token = normalize_owned(raw.refresh_token)
+        .ok_or_else(|| CodexOAuthError::ParseError("导入 JSON 缺少 refresh_token".to_string()))?;
+
+    let email = normalize_owned(raw.email);
+    let display_name = normalize_str(display_name).or_else(|| normalize_owned(raw.name));
+
+    let native_auth = access_token.as_deref().map(|token| {
+        build_native_auth_json(&account_id, token, &refresh_token, id_token.as_deref())
+    });
+
+    Ok(ExternalCodexAccountImport {
+        upstream_account_id: account_id,
+        refresh_token,
+        id_token,
+        email,
+        display_name,
+        native_auth,
     })
 }
 
@@ -1539,6 +1812,7 @@ mod tests {
                     None,
                     Some("user@example.com".to_string()),
                     None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1549,6 +1823,180 @@ mod tests {
         let accounts = manager2.list_accounts().await;
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].id, "acc-123");
+    }
+
+    #[tokio::test]
+    async fn test_import_external_account_json_adds_account_without_changing_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+
+        manager
+            .add_account_internal(
+                "default-acc".to_string(),
+                "rt-default".to_string(),
+                None,
+                Some("default@example.com".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let account = manager
+            .import_external_account_json(
+                r#"{
+                    "account_id": "external-acc",
+                    "chatgpt_account_id": "external-acc",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "email": "raw@example.com",
+                    "name": "Raw Name"
+                }"#,
+                Some("企业号"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(account.id, "external-acc");
+        assert_eq!(account.login, "企业号");
+
+        let status = manager.get_status().await;
+        assert_eq!(status.accounts.len(), 2);
+        assert_eq!(status.default_account_id.as_deref(), Some("default-acc"));
+        assert!(status
+            .accounts
+            .iter()
+            .any(|account| account.id == "external-acc" && account.login == "企业号"));
+    }
+
+    #[tokio::test]
+    async fn test_import_external_account_json_rejects_duplicate_without_overwriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+
+        manager
+            .add_account_internal(
+                "external-acc".to_string(),
+                "original-refresh".to_string(),
+                None,
+                Some("Original".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = manager
+            .import_external_account_json(
+                r#"{
+                    "account_id": "external-acc",
+                    "access_token": "new-access",
+                    "refresh_token": "new-refresh"
+                }"#,
+                Some("企业号"),
+            )
+            .await
+            .expect_err("duplicate import should fail");
+
+        assert!(err.to_string().contains("已存在"));
+
+        let accounts = manager.list_accounts().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].login, "Original");
+    }
+
+    #[tokio::test]
+    async fn test_import_external_account_json_allows_same_upstream_with_different_email() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+
+        manager
+            .add_account_internal(
+                "shared-upstream".to_string(),
+                "original-refresh".to_string(),
+                None,
+                Some("old@example.com".to_string()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let account = manager
+            .import_external_account_json(
+                r#"{
+                    "account_id": "shared-upstream",
+                    "chatgpt_account_id": "shared-upstream",
+                    "access_token": "access-token",
+                    "refresh_token": "new-refresh",
+                    "email": "new@example.com",
+                    "name": "new@example.com"
+                }"#,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(account.id, "shared-upstream");
+        assert_eq!(account.login, "new@example.com");
+
+        let status = manager.get_status().await;
+        assert_eq!(status.accounts.len(), 2);
+        assert_eq!(
+            status.default_account_id.as_deref(),
+            Some("shared-upstream")
+        );
+        assert!(status
+            .accounts
+            .iter()
+            .any(|account| account.id == "shared-upstream" && account.login == "old@example.com"));
+        assert!(status
+            .accounts
+            .iter()
+            .any(|stored| stored.id == account.id && stored.login == "new@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_import_external_account_json_display_name_survives_native_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+
+        manager
+            .import_external_account_json(
+                r#"{
+                    "account_id": "external-acc",
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "email": "raw@example.com"
+                }"#,
+                Some("企业号"),
+            )
+            .await
+            .unwrap();
+
+        manager
+            .upsert_native_account_snapshot(
+                NativeCodexAccountSnapshot {
+                    account_id: "external-acc".to_string(),
+                    email: Some("real@example.com".to_string()),
+                    id_token: None,
+                    refresh_token: "new-refresh-token".to_string(),
+                    access_token: Some("new-access-token".to_string()),
+                    native_auth: build_native_auth_json(
+                        "external-acc",
+                        "new-access-token",
+                        "new-refresh-token",
+                        None,
+                    ),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+
+        let accounts = manager.list_accounts().await;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].login, "企业号");
     }
 
     #[tokio::test]
@@ -1563,6 +2011,7 @@ mod tests {
                 None,
                 Some("a@example.com".to_string()),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1572,6 +2021,7 @@ mod tests {
                 "rt2".to_string(),
                 None,
                 Some("b@example.com".to_string()),
+                None,
                 None,
             )
             .await
