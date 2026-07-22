@@ -611,8 +611,8 @@ fn restore_live_settings_for_provider_backfill(
 
     // `modelCatalog` is a cc-switch–private field whose SSOT is the DB. Live's
     // `config.toml` only carries a lossy projection (`model_catalog_json` →
-    // generated catalog file) that proxy takeover/restore cycles and Codex.app
-    // config rewrites can drop, so `read_live_settings` may reconstruct it as
+    // generated catalog file) that proxy takeover/restore cycles and Codex/ChatGPT
+    // desktop config rewrites can drop, so `read_live_settings` may reconstruct it as
     // absent. Never let a switch-away backfill from Live erase the stored
     // mapping: prefer the DB provider's `modelCatalog`, falling back to whatever
     // Live reconstructed only when the DB has none.
@@ -1736,7 +1736,7 @@ mod tests {
         // Reproduces the data-loss bug: switching away from a Codex provider
         // backfills the outgoing provider from Live, but Live's config.toml had
         // already lost its `model_catalog_json` projection (proxy cycle /
-        // Codex.app rewrite), so `read_live_settings` reconstructs no catalog.
+        // Codex/ChatGPT desktop rewrite), so `read_live_settings` reconstructs no catalog.
         // The stored mapping must survive the backfill.
         let mut provider = Provider::with_id(
             "deepseek".to_string(),

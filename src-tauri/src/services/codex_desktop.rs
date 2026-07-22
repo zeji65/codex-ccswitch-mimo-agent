@@ -22,6 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 const CODEX_OAUTH_AUTH_PROVIDER: &str = "codex_oauth";
+const CODEX_DESKTOP_APP_NAMES: &[&str] = &["ChatGPT", "Codex"];
 
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeBackup {
@@ -343,8 +344,9 @@ fn restore_current_provider(state: &AppState, provider_id: Option<&str>) -> Resu
 
 #[cfg(all(target_os = "macos", not(test)))]
 pub fn launch_codex_app() -> Result<(), AppError> {
-    let app_path = find_codex_app_path()
-        .ok_or_else(|| AppError::Message("未找到 Codex.app，请确认已安装桌面版".to_string()))?;
+    let app_path = find_codex_app_path().ok_or_else(|| {
+        AppError::Message("未找到 ChatGPT.app 或 Codex.app，请确认已安装桌面版".to_string())
+    })?;
 
     let status = Command::new("open")
         .arg(&app_path)
@@ -353,8 +355,9 @@ pub fn launch_codex_app() -> Result<(), AppError> {
 
     if !status.success() {
         return Err(AppError::Message(format!(
-            "启动 Codex.app 失败，退出码: {:?}",
-            status.code()
+            "启动桌面版失败：{}，退出码: {:?}",
+            app_path.display(),
+            status.code(),
         )));
     }
 
@@ -368,12 +371,17 @@ pub fn launch_codex_app() -> Result<(), AppError> {
 
 #[cfg(all(target_os = "macos", not(test)))]
 fn find_codex_app_path() -> Option<PathBuf> {
-    let candidates = [
-        PathBuf::from("/Applications/Codex.app"),
-        get_home_dir().join("Applications/Codex.app"),
+    let app_dirs = [
+        PathBuf::from("/Applications"),
+        get_home_dir().join("Applications"),
     ];
 
-    candidates.into_iter().find(|path| path.exists())
+    CODEX_DESKTOP_APP_NAMES.iter().find_map(|app_name| {
+        app_dirs
+            .iter()
+            .map(|dir| dir.join(format!("{app_name}.app")))
+            .find(|path| path.exists())
+    })
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -416,8 +424,12 @@ fn list_running_codex_pids() -> Result<Vec<i32>, AppError> {
 
 fn is_codex_process_command(command: &str) -> bool {
     let normalized = command.replace('\\', "/");
-    normalized.ends_with("/Codex.app/Contents/MacOS/Codex")
-        || normalized.contains("/Codex.app/Contents/Frameworks/Codex Helper.app/")
+    CODEX_DESKTOP_APP_NAMES.iter().any(|app_name| {
+        normalized.ends_with(&format!("/{app_name}.app/Contents/MacOS/{app_name}"))
+            || normalized.contains(&format!(
+                "/{app_name}.app/Contents/Frameworks/{app_name} Helper"
+            ))
+    })
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
@@ -454,7 +466,7 @@ fn stop_codex_processes() -> Result<(), AppError> {
     }
 
     Err(AppError::Message(
-        "无法完全停止 Codex.app，请先手动退出后再重试".to_string(),
+        "无法完全停止 ChatGPT.app 或 Codex.app，请先手动退出后再重试".to_string(),
     ))
 }
 
@@ -500,8 +512,20 @@ mod tests {
         assert!(is_codex_process_command(
             "/Applications/Codex.app/Contents/Frameworks/Codex Helper.app/Contents/MacOS/Codex Helper --type=gpu-process"
         ));
+        assert!(is_codex_process_command(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(is_codex_process_command(
+            "/Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper.app/Contents/MacOS/ChatGPT Helper --type=gpu-process"
+        ));
+        assert!(is_codex_process_command(
+            "/Applications/ChatGPT.app/Contents/Frameworks/ChatGPT Helper (Renderer).app/Contents/MacOS/ChatGPT Helper (Renderer) --type=renderer"
+        ));
         assert!(!is_codex_process_command(
             "/Applications/Codex.app/Contents/Resources/codex app-server"
+        ));
+        assert!(!is_codex_process_command(
+            "/Applications/ChatGPT.app/Contents/Resources/chatgpt app-server"
         ));
         assert!(!is_codex_process_command(
             "/Applications/Other.app/Contents/MacOS/Other"
